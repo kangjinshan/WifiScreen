@@ -11,9 +11,8 @@
 
 - **[下载最新 APK](https://github.com/kangjinshan/WifiScreen/releases/latest)**：在 Assets 中下载 `wifiscreen-版本号.apk`。
 - **[GitHub Actions 构建记录](https://github.com/kangjinshan/WifiScreen/actions/workflows/android.yml)**：每次版本发布会在 GitHub 直接编译，提供 APK、SHA-256 和源码提交信息。
-- 也可在 [TV App Store](https://tvstore.jinshanweb.com/app-detail.html?id=9) 安装「投屏助手（开发版）」。
 
-将 APK 通过 U 盘、局域网文件传输或电视浏览器安装到投影仪 / 电视。应用包名为 `com.kanayama.wifiscreen`。官方 GitHub 构建沿用发布签名，可与 TV App Store 版本相互覆盖更新。
+将 APK 通过 U 盘、局域网文件传输或电视浏览器安装到投影仪 / 电视。应用包名为 `com.kanayama.wifiscreen`。官方 APK 沿用同一发布签名，后续版本可覆盖安装。
 
 ## 开始投屏
 
@@ -92,6 +91,7 @@ cd android
 
 - 推送 `v版本号` 标签，例如 `v0.1.3`，会自动运行测试、Lint、Release 构建，并把 APK 发布到 GitHub Releases。
 - 在 **Actions → Build Android APK → Run workflow** 可手动编译当前分支；完成后从该次运行的 Artifacts 下载。
+- 若某个版本的构建需要重试，可在最新工作流中填写已有的 `release_tag`（如 `v0.1.3`），从该标签源码编译并发布；流程会校验源码提交与标签一致。
 - 标签版本必须与 APK 的 `versionName` 一致。版本号和版本码在 `android/app/build.gradle.kts` 中维护。
 
 Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variables → Actions** 配置：
