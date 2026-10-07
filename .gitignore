@@ -1,0 +1,21 @@
+.research/
+artifacts/
+output/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/signing.properties
+*.keystore
+*.jks
+.DS_Store
+__pycache__/
+*.pyc
+# Local field notes and unrelated setup research contain device-specific information.
+docs/current-status.md
+tools/adb-setup/
+android/.idea/
+*.apk
+*.aab
+dist/
+docs/opensource-research.md

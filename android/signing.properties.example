@@ -1,0 +1,5 @@
+# Copy to signing.properties locally; keep the real file out of Git.
+# Paths must be absolute. The password file must contain only the keystore password.
+storeFile=/absolute/path/to/wifiscreen-release.jks
+storePasswordFile=/absolute/path/to/wifiscreen-release.password
+keyAlias=wifiscreen
