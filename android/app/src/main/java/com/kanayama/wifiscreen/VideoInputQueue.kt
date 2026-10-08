@@ -25,6 +25,6 @@ class VideoInputQueue<T>(capacity: Int) {
         return false
     }
 
-    fun poll(): T? = try { queue.poll(5, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { null }
+    fun poll(waitMs: Long = 5): T? = try { queue.poll(waitMs, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { null }
     fun close() { closed = true; queue.clear() }
 }

@@ -13,15 +13,38 @@ class VideoPresentationClock {
     private var baseNs = 0L
     private var previousPtsUs: Long? = null
     private var lateSinceNs: Long? = null
+    private var recoveringBacklog = false
+    private var lastCatchUpPreviewNs: Long? = null
 
-    fun reset() { firstPtsUs = null; previousPtsUs = null; lateSinceNs = null }
+    fun reset() {
+        firstPtsUs = null; previousPtsUs = null; lateSinceNs = null
+        recoveringBacklog = false; lastCatchUpPreviewNs = null
+    }
 
     fun observeInput(ptsUs: Long, receivedNs: Long) {
         if (firstPtsUs == null) { firstPtsUs = ptsUs; baseNs = receivedNs + PlaybackTiming.BUFFER_NS }
     }
 
     /** Null means skip presentation of a late picture, never skip its decoding/reference data. */
-    fun presentationTime(ptsUs: Long, nowNs: Long): Long? {
+    fun presentationTime(ptsUs: Long, nowNs: Long, catchingUp: Boolean = false): Long? {
+        if (catchingUp) {
+            recoveringBacklog = true
+            lateSinceNs = null
+            // Decode every reference, but do not pace an old queue at source FPS.
+            // A sparse immediate preview keeps the first-frame/audio lifecycle
+            // alive even on hardware that cannot decode faster than the sender.
+            val previous = lastCatchUpPreviewNs
+            if (previous == null || nowNs - previous >= 100_000_000L) {
+                lastCatchUpPreviewNs = nowNs
+                return nowNs
+            }
+            return null
+        }
+        if (recoveringBacklog) {
+            firstPtsUs = ptsUs; baseNs = nowNs + PlaybackTiming.BUFFER_NS
+            previousPtsUs = null; lateSinceNs = null
+            recoveringBacklog = false; lastCatchUpPreviewNs = null
+        }
         val first = firstPtsUs
         if (first == null || previousPtsUs?.let { ptsUs <= it } == true) {
             firstPtsUs = ptsUs

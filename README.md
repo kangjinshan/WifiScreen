@@ -6,7 +6,7 @@
 
 **[下载最新版 APK](https://github.com/kangjinshan/WifiScreen/releases/latest)** · [查看更新](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
-主干源码已更新至 **0.2.2**，修复部分 Redmi 投屏时画面正常但完全无声的问题。GitHub Releases 目前仍为 0.2.1，尚未发布包含该修复的 APK。
+主干源码已更新至 **0.2.3**，包含 Redmi 无声修复和视频积压时的低延迟追帧。GitHub Releases 目前仍为 0.2.1，尚未发布包含这些修复的 APK。
 
 ![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
@@ -112,6 +112,8 @@
 <summary><strong>投屏卡顿、延迟较大，或者画面停住</strong></summary>
 
 先检查网络连接，尽量靠近路由器；条件允许时让电视使用有线网络。结束本次投屏后重新连接，并确认使用的是最新发布版本。
+
+0.2.3 缩短接收端视频队列，在积压时加速解码、跳过过时画面的显示，追上手机后恢复正常播放节奏。完整保留解码需要的参考帧。
 
 如果问题反复出现，请按下面的方式提交设备信息与诊断报告。画面和声音的实际延迟还取决于手机、网络与电视，接收端缓冲数值不代表整条投屏链路的延迟。
 

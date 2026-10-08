@@ -112,6 +112,7 @@ class LegacyReceiver(
             "\n视频尺寸：" + decoder.width + " × " + decoder.height +
             "\n解码状态：" + decoder.decoderState +
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
+            "\n视频正在追帧：" + decoder.catchingUp + "\n画面接收至显示：" + decoder.receiverLatencyMs + " ms" +
             "\n接收关键帧：" + decoder.keyframes.get() + "\n距上次视频输出：" + decoder.outputAgeMs + " ms" +
             "\n音频包：" + sound.packets.get() + "\nPCM 写入：" + sound.pcmBytes.get() + " bytes" +
             "\n音频播放已启动：" + sound.playing + "\n实际播放样本：" + sound.playedFrames +
@@ -270,6 +271,8 @@ class LegacyReceiver(
                             .put("videoWidth", current?.decoder?.width ?: 0)
                             .put("videoHeight", current?.decoder?.height ?: 0)
                             .put("videoQueueDepth", current?.decoder?.queueDepth ?: 0)
+                            .put("videoCatchingUp", current?.decoder?.catchingUp ?: false)
+                            .put("videoReceiverLatencyMs", current?.decoder?.receiverLatencyMs ?: -1)
                             .put("videoBackpressureWaits", current?.decoder?.backpressureWaits ?: 0)
                             .put("videoKeyframes", current?.decoder?.keyframes?.get() ?: 0)
                             .put("videoOutputAgeMs", current?.decoder?.outputAgeMs ?: -1)

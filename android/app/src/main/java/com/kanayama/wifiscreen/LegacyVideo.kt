@@ -14,14 +14,19 @@ class LegacyVideo(
     private val firstFrame: (Int, Int) -> Unit,
     private val error: (String) -> Unit
 ) {
-    private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long)
-    private val queue = VideoInputQueue<Input>(32)
+    private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long,
+        var accessUnit: ByteArray? = null)
+    private val queue = VideoInputQueue<Input>(4)
     @Volatile private var running = true
     val received = AtomicLong()
     val decoded = AtomicLong()
     val presented = AtomicLong()
     val dropped = AtomicLong()
     val keyframes = AtomicLong()
+    @Volatile var catchingUp = false
+        private set
+    @Volatile var receiverLatencyMs = -1L
+        private set
     val queueDepth: Int get() = queue.size
     val backpressureWaits: Long get() = queue.waits.get()
     @Volatile var decoderState = "等待视频参数"
@@ -53,6 +58,8 @@ class LegacyVideo(
         var awaitingKeyframe = true
         var announced = false
         var pending: Input? = null
+        val inputArrivals = linkedMapOf<Long, java.util.ArrayDeque<Long>>()
+        var inFlight = 0
         val presentationClock = VideoPresentationClock()
         val info = MediaCodec.BufferInfo()
         fun release() {
@@ -63,16 +70,25 @@ class LegacyVideo(
             configuredSurface = null
             awaitingKeyframe = true
             presentationClock.reset()
+            inputArrivals.clear(); inFlight = 0
+            catchingUp = false; receiverLatencyMs = -1
             decoderState = "等待关键帧"
         }
+        // Allow the hardware codec's normal pipeline. An old source timestamp
+        // alone does not mean removable queueing, especially on OEM decoders.
+        fun hasBacklog(): Boolean = queue.size >= 2 || inFlight > 4
         try {
             while (running) {
-                val input = pending ?: queue.poll()
+                var progressed = false
+                // Sleep on incoming data when the codec is empty, but never
+                // delay draining pending output. This also leaves CPU for audio.
+                val input = pending ?: queue.poll(if (codec == null || inFlight == 0) 5 else 0)
                 pending = null
                 if (input != null) {
                     val frame = input.frame
                     try {
                         if (frame.kind == 1) {
+                            progressed = true
                             val parameters = LegacyAvc.configuration(frame.data)
                             val changed = config?.let { !it.sps.contentEquals(parameters.sps) || !it.pps.contentEquals(parameters.pps) } ?: true
                             config = parameters
@@ -115,8 +131,8 @@ class LegacyVideo(
                                 }
                                 configuredSurface = target
                             }
-                            val unit = LegacyAvc.accessUnit(frame.data, input.streamTime)
-                            val index = codec!!.dequeueInputBuffer(10_000)
+                            val unit = input.accessUnit ?: LegacyAvc.accessUnit(frame.data, input.streamTime).also { input.accessUnit = it }
+                            val index = codec!!.dequeueInputBuffer(0)
                             if (index >= 0) {
                                 decoderState = "正在解码"
                                 val buffer = codec!!.getInputBuffer(index)!!
@@ -124,6 +140,9 @@ class LegacyVideo(
                                 if (buffer.remaining() < unit.size) throw IllegalArgumentException("Video input buffer too small")
                                 buffer.put(unit)
                                 codec!!.queueInputBuffer(index, 0, unit.size, frame.timeUs, 0)
+                                inputArrivals.getOrPut(frame.timeUs) { java.util.ArrayDeque() }.addLast(input.receivedNs)
+                                inFlight++
+                                progressed = true
                                 awaitingKeyframe = false
                             } else {
                                 decoderState = "等待解码缓冲区"
@@ -143,22 +162,46 @@ class LegacyVideo(
                     while (running) {
                         val index = current.dequeueOutputBuffer(info, 0)
                         if (index >= 0) {
-                            val targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime())
+                            progressed = true
+                            inFlight = (inFlight - 1).coerceAtLeast(0)
+                            val arrivals = inputArrivals[info.presentationTimeUs]
+                            val receivedNs = arrivals?.pollFirst()
+                            if (arrivals?.isEmpty() == true) inputArrivals.remove(info.presentationTimeUs)
+                            if (receivedNs == null && inputArrivals.isNotEmpty()) {
+                                // Some OEM codecs rewrite timestamps. Do not report
+                                // a guessed latency, and keep tracking bounded.
+                                val first = inputArrivals.entries.first()
+                                first.value.pollFirst()
+                                if (first.value.isEmpty()) inputArrivals.remove(first.key)
+                            }
+                            catchingUp = hasBacklog()
+                            var targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime(), catchingUp)
+                            if (targetNs != null) {
+                                while (running && targetNs!! > System.nanoTime()) {
+                                    if (hasBacklog()) {
+                                        catchingUp = true
+                                        targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime(), true)
+                                        break
+                                    }
+                                    Thread.sleep(1)
+                                }
+                            }
+                            if (!running) break
                             if (targetNs == null) {
                                 current.releaseOutputBuffer(index, false)
                                 dropped.incrementAndGet()
                             } else {
                                 // Older TV codecs do not consistently honor the timestamped release overload.
-                                // Pace in our thread, then use the widely supported immediate render call.
-                                while (running && targetNs > System.nanoTime()) Thread.sleep(1)
-                                if (!running) break
+                                // Use immediate rendering after the bounded pacing above.
                                 current.releaseOutputBuffer(index, true)
+                                receiverLatencyMs = receivedNs?.let { (System.nanoTime() - it) / 1_000_000L } ?: -1
                                 presented.incrementAndGet()
                             }
                             decoded.incrementAndGet()
                             lastOutputAt = SystemClock.elapsedRealtime()
                             if (!announced && targetNs != null) { announced = true; firstFrame(width, height) }
                         } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            progressed = true
                             val output = current.outputFormat
                             width = if (output.containsKey("crop-right"))
                                 output.getInteger("crop-right") - (if (output.containsKey("crop-left")) output.getInteger("crop-left") else 0) + 1 else output.getInteger(MediaFormat.KEY_WIDTH)
@@ -171,7 +214,10 @@ class LegacyVideo(
                     release()
                     error("视频输出：" + (failure.message ?: failure.javaClass.simpleName))
                 }
+                if (!progressed) Thread.sleep(1)
             }
+        } catch (_: InterruptedException) {
+            // Closing a session interrupts the idle decoder wait.
         } finally { release(); decoderState = "已停止" }
     }
 
