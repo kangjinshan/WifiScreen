@@ -82,6 +82,7 @@ class LegacyReceiver(
         @Volatile private var audioAllowed = false
         @Volatile private var userVolume = 0.7f
         @Volatile private var ducked = false
+        private val playbackClock = AvPlaybackClock()
         private val focusListener = AudioManager.OnAudioFocusChangeListener { focus ->
             audioAllowed = focus == AudioManager.AUDIOFOCUS_GAIN || focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
             ducked = focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
@@ -99,10 +100,10 @@ class LegacyReceiver(
                     rendered(width, height)
                 }
             }
-        }, { failure -> if (!closed && active === this) { lastError = failure; reportState(failure) } })
+        }, { failure -> if (!closed && active === this) { lastError = failure; reportState(failure) } }, playbackClock)
         val sound = LegacyAudio({ hasPicture && audioAllowed && !closed }, { failure ->
             if (!closed && active === this) lastError = failure
-        })
+        }, playbackClock)
         fun applyVolume() { sound.volume = if (muted) 0f else userVolume * if (ducked) 0.2f else 1f }
         fun volume(value: Float) { userVolume = value; applyVolume() }
         fun report(): String = "接收端：" + name + "\n手机 IP：" + peer +
@@ -113,11 +114,14 @@ class LegacyReceiver(
             "\n解码状态：" + decoder.decoderState +
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
             "\n视频正在追帧：" + decoder.catchingUp + "\n画面接收至显示：" + decoder.receiverLatencyMs + " ms" +
+            "\n视频跟随音频：" + decoder.usingAudioClock + "\n音画时间差：" + decoder.audioSkewMs + " ms" +
             "\n接收关键帧：" + decoder.keyframes.get() + "\n距上次视频输出：" + decoder.outputAgeMs + " ms" +
             "\n音频包：" + sound.packets.get() + "\nPCM 写入：" + sound.pcmBytes.get() + " bytes" +
             "\n音频播放已启动：" + sound.playing + "\n实际播放样本：" + sound.playedFrames +
             "\n音频时间戳兼容回退：" + sound.timestampFallbacks + "\n音频时间轴重置：" + sound.timestampResets.get() +
             "\n音频播放欠载：" + sound.underruns + "\n音频缓冲：" + sound.bufferedMs + " ms" +
+            "\n波形补偿样本：" + sound.concealedSamples.get() + "\n防欠载补偿样本：" + sound.starvationSamples.get() +
+            "\n跳过音频缺口样本：" + sound.skippedSamples.get() + "\n已补偿的迟到样本：" + sound.overlapSamples.get() +
             "\n系统原有音频缓冲：" + sound.platformBufferMs + " ms" +
             "\n音频 RTP 缺包 / 乱序：" + sound.missingPackets + " / " + sound.reorderedPackets +
             "\n音频到达抖动估计：" + String.format(java.util.Locale.ROOT, "%.2f", sound.jitterMs) + " ms" +
@@ -273,6 +277,9 @@ class LegacyReceiver(
                             .put("videoQueueDepth", current?.decoder?.queueDepth ?: 0)
                             .put("videoCatchingUp", current?.decoder?.catchingUp ?: false)
                             .put("videoReceiverLatencyMs", current?.decoder?.receiverLatencyMs ?: -1)
+                            .put("videoUsingAudioClock", current?.decoder?.usingAudioClock ?: false)
+                            .put("videoAudioSkewMs", current?.decoder?.audioSkewMs ?: 0)
+                            .put("videoAudioSyncDrops", current?.decoder?.audioSyncDrops?.get() ?: 0)
                             .put("videoBackpressureWaits", current?.decoder?.backpressureWaits ?: 0)
                             .put("videoKeyframes", current?.decoder?.keyframes?.get() ?: 0)
                             .put("videoOutputAgeMs", current?.decoder?.outputAgeMs ?: -1)
@@ -280,8 +287,11 @@ class LegacyReceiver(
                             .put("videoPresentationDrops", current?.decoder?.dropped?.get() ?: 0)
                             .put("audioPackets", current?.sound?.packets?.get() ?: 0)
                             .put("audioPcmBytes", current?.sound?.pcmBytes?.get() ?: 0)
+                            .put("audioDecodedSamples", current?.sound?.decodedSamples?.get() ?: 0)
                             .put("audioPlaying", current?.sound?.playing ?: false)
                             .put("audioPlayedFrames", current?.sound?.playedFrames ?: 0)
+                            .put("audioHardwareClock", current?.sound?.hardwareClock ?: false)
+                            .put("audioHardwareLagMs", current?.sound?.hardwareLagMs ?: 0)
                             .put("audioTimestampFallbacks", current?.sound?.timestampFallbacks ?: 0)
                             .put("audioCodec", current?.sound?.codecName ?: "")
                             .put("audioReady", current?.sound?.ready ?: false)
@@ -300,6 +310,9 @@ class LegacyReceiver(
                             .put("audioRtpJitterMs", current?.sound?.jitterMs ?: 0.0)
                             .put("audioInputRetries", current?.sound?.inputRetries?.get() ?: 0)
                             .put("audioConcealedSamples", current?.sound?.concealedSamples?.get() ?: 0)
+                            .put("audioStarvationSamples", current?.sound?.starvationSamples?.get() ?: 0)
+                            .put("audioSkippedSamples", current?.sound?.skippedSamples?.get() ?: 0)
+                            .put("audioOverlapSamples", current?.sound?.overlapSamples?.get() ?: 0)
                             .put("audioTimestampResets", current?.sound?.timestampResets?.get() ?: 0)
                             .put("lastError", lastError).toString()
                         type = "application/json"

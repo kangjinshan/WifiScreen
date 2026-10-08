@@ -4,29 +4,39 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Process
 import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicLong
 
-class LegacyAudio(private val audible: () -> Boolean, private val error: (String) -> Unit) {
+class LegacyAudio(private val audible: () -> Boolean, private val error: (String) -> Unit,
+    private val playbackClock: AvPlaybackClock = AvPlaybackClock()) {
     private val queue = AudioRtpQueue()
     private val sampleClock = AudioSampleClock()
     @Volatile private var running = true
+    @Volatile private var lastPacketAtNs = 0L
     @Volatile var volume = 0.7f
     val packets = AtomicLong()
     val pcmBytes = AtomicLong()
+    val decodedSamples = AtomicLong()
     val inputRetries = AtomicLong()
     val concealedSamples = AtomicLong()
+    val starvationSamples = AtomicLong()
+    val skippedSamples = AtomicLong()
+    val overlapSamples = AtomicLong()
     val timestampResets = AtomicLong()
     val timestampFallbacks: Long get() = sampleClock.timestampFallbacks
     @Volatile var playing = false
         private set
     @Volatile var playedFrames = 0L
+        private set
+    @Volatile var hardwareClock = false
+        private set
+    @Volatile var hardwareLagMs = 0L
         private set
     val queueDepth: Int get() = queue.size
     val missingPackets: Long get() = queue.missingPackets
@@ -55,10 +65,12 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         val data = payload(rtp) ?: return
         packets.incrementAndGet()
         if (!running || !audible() || !ready) return
+        val receivedNs = System.nanoTime()
+        lastPacketAtNs = receivedNs
         val header = ByteBuffer.wrap(rtp)
         queue.offer(AudioRtpFrame(header.getShort(2).toInt() and 65535,
             header.getInt(4).toLong() and 0xffffffffL, data,
-            ssrc = header.getInt(8).toLong() and 0xffffffffL), System.nanoTime())
+            ssrc = header.getInt(8).toLong() and 0xffffffffL), receivedNs)
     }
 
     private fun play() {
@@ -70,27 +82,53 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         var pending: AudioRtpFrame? = null
         var activeSsrc: Long? = null
         var firstOutputPts: Long? = null
-        var nextSample = 0L
         var writtenFrames = 0L
         var previousPlaybackHead = 0L
         var trackPlayedFrames = 0L
+        val hardwareTimestamp = AudioTimestamp()
+        var timestampPolledAt = 0L
+        var hardwareFrame = -1L
+        var hardwareAtNs = 0L
+        var hardwareProgressAtNs = 0L
         var prerollWritten = 0
         var prerollDeadlineNs = 0L
         var prerollOriginNs = 0L
         var trackPlaying = false
         var savedUnderruns = 0
-        var lastSamples = shortArrayOf(0, 0)
+        var continuity = AudioContinuity(outputRate, outputChannels)
+        var countedConcealed = 0L
+        var countedStarvation = 0L
+        var countedSkipped = 0L
+        var countedOverlap = 0L
         var prerollBytes = 0
         var baselineFrames = 0
         var baselineRate = 0
         var baselineChannels = 0
         val info = MediaCodec.BufferInfo()
 
+        fun updateContinuityCounters() {
+            concealedSamples.addAndGet(continuity.concealedSamples - countedConcealed)
+            starvationSamples.addAndGet(continuity.starvationSamples - countedStarvation)
+            skippedSamples.addAndGet(continuity.skippedSamples - countedSkipped)
+            overlapSamples.addAndGet(continuity.overlapSamples - countedOverlap)
+            countedConcealed = continuity.concealedSamples; countedStarvation = continuity.starvationSamples
+            countedSkipped = continuity.skippedSamples; countedOverlap = continuity.overlapSamples
+        }
+        fun resetContinuity() {
+            updateContinuityCounters()
+            continuity = AudioContinuity(outputRate, outputChannels)
+            countedConcealed = 0; countedStarvation = 0; countedSkipped = 0; countedOverlap = 0
+            playbackClock.resetAudio(outputRate)
+        }
+
         fun clearTrackState() {
             trackPlaying = false; writtenFrames = 0; prerollWritten = 0
             playing = false; bufferedMs = 0; previousPlaybackHead = 0; trackPlayedFrames = 0
+            hardwareClock = false; hardwareFrame = -1; hardwareAtNs = 0; timestampPolledAt = 0
+            hardwareProgressAtNs = 0; hardwareLagMs = 0
             prerollDeadlineNs = 0; prerollOriginNs = 0
-            firstOutputPts = null; nextSample = 0
+            firstOutputPts = null
+            playbackClock.resetAudio(outputRate)
         }
         fun updatePlaybackState() {
             track?.let { output ->
@@ -100,6 +138,20 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                 previousPlaybackHead = head
                 playing = output.playState == AudioTrack.PLAYSTATE_PLAYING
                 bufferedMs = ((writtenFrames - trackPlayedFrames).coerceAtLeast(0) * 1000 / outputRate).toInt()
+                val nowNs = System.nanoTime()
+                if (playing && nowNs - timestampPolledAt >= 20_000_000L) {
+                    timestampPolledAt = nowNs
+                    if (runCatching { output.getTimestamp(hardwareTimestamp) }.getOrDefault(false)) {
+                        if (hardwareTimestamp.framePosition != hardwareFrame) hardwareProgressAtNs = nowNs
+                        hardwareFrame = hardwareTimestamp.framePosition
+                        hardwareAtNs = hardwareTimestamp.nanoTime
+                    }
+                }
+                hardwareLagMs = if (hardwareFrame >= 0) (trackPlayedFrames - hardwareFrame) * 1000 / outputRate else 0
+                hardwareClock = playing && AudioTimestampQuality.usable(trackPlayedFrames, hardwareFrame,
+                    writtenFrames, hardwareAtNs, hardwareProgressAtNs, nowNs, outputRate)
+                if (hardwareClock) playbackClock.updateAudio(hardwareFrame, hardwareAtNs, true)
+                else playbackClock.updateAudio(trackPlayedFrames, nowNs, playing)
                 if (Build.VERSION.SDK_INT >= 24) underruns = savedUnderruns + output.underrunCount
             }
         }
@@ -138,10 +190,10 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                     else prerollBytes * 1000 / (outputRate * bytesPerFrame)
             }
         }
-        fun writePcm(data: ByteArray) {
+        fun writePcm(block: PcmBlock) {
+            val data = block.data
             if (track == null) {
                 track = makeTrack()
-                lastSamples = ShortArray(outputChannels)
             }
             if (prerollDeadlineNs == 0L) prerollDeadlineNs =
                 (if (prerollOriginNs > 0) prerollOriginNs else System.nanoTime()) + PlaybackTiming.BUFFER_NS
@@ -168,6 +220,8 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                     continue
                 }
                 noProgressSince = 0
+                playbackClock.appendAudio(block.mediaSample + offset / (outputChannels * 2),
+                    written / (outputChannels * 2), System.nanoTime())
                 offset += written; prerollWritten += written
                 writtenFrames += written / (outputChannels * 2)
                 pcmBytes.addAndGet(written.toLong())
@@ -190,13 +244,14 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                 it.configure(format, null, null, 0); it.start()
             }
             track = makeTrack()
+            resetContinuity()
             ready = true
             while (running) {
                 val frame = pending ?: queue.poll(System.nanoTime())
                 pending = null
                 if (frame != null) {
                     if (activeSsrc != null && activeSsrc != frame.ssrc) {
-                        codec!!.flush(); closeTrack(); sampleClock.reset()
+                        codec!!.flush(); closeTrack(); sampleClock.reset(); resetContinuity()
                         timestampResets.incrementAndGet()
                     }
                     activeSsrc = frame.ssrc
@@ -208,6 +263,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                         input.put(frame.data)
                         if (prerollOriginNs == 0L) prerollOriginNs = frame.receivedNs
                         val samples = sampleClock.position(frame.sequence, frame.timestamp)
+                        playbackClock.observeAudio(samples * outputRate / AudioSampleClock.SAMPLE_RATE, frame.receivedNs)
                         // The fixed-duration clock preserves gaps without trusting legacy RTP timestamp units.
                         codec!!.queueInputBuffer(index, 0, frame.data.size, samples * 1_000_000L / AudioSampleClock.SAMPLE_RATE, 0)
                     } else {
@@ -222,35 +278,21 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                         val output = decoder.outputFormat
                         val rate = output.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         val channels = output.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        if (rate != outputRate || channels != outputChannels) closeTrack()
+                        val changed = rate != outputRate || channels != outputChannels
+                        if (changed) closeTrack()
                         outputRate = rate; outputChannels = channels
+                        if (changed) resetContinuity()
                     } else if (outputIndex >= 0) {
                         val output = decoder.getOutputBuffer(outputIndex)!!
                         output.position(info.offset); output.limit(info.offset + info.size)
                         val pcm = ByteArray(info.size); output.get(pcm)
                         decoder.releaseOutputBuffer(outputIndex, false)
                         if (pcm.isNotEmpty() && audible()) {
+                            decodedSamples.addAndGet((pcm.size / (outputChannels * 2)).toLong())
                             if (firstOutputPts == null) firstOutputPts = info.presentationTimeUs
-                            var position = ((info.presentationTimeUs - firstOutputPts!!) * outputRate + 500_000) / 1_000_000
-                            val gap = position - nextSample
-                            val budgetFrames = PlaybackTiming.audioPrerollBytes(outputRate, outputChannels) / (outputChannels * 2)
-                            if (gap in 1..budgetFrames.toLong()) {
-                                writePcm(PcmGap.silenceWithFade(gap.toInt(), lastSamples))
-                                PcmGap.fadeIn(pcm, outputChannels)
-                                concealedSamples.addAndGet(gap)
-                            } else if (gap > budgetFrames || gap < -1) {
-                                // A long outage must not turn into accumulating playback latency.
-                                closeTrack(); firstOutputPts = info.presentationTimeUs; position = 0
-                                PcmGap.fadeIn(pcm, outputChannels)
-                                timestampResets.incrementAndGet()
-                            }
-                            writePcm(pcm)
-                            nextSample = position + pcm.size / (outputChannels * 2)
-                            if (pcm.size >= outputChannels * 2) {
-                                val tail = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
-                                for (channel in 0 until outputChannels)
-                                    lastSamples[channel] = tail.getShort(pcm.size - outputChannels * 2 + channel * 2)
-                            }
+                            val position = ((info.presentationTimeUs - firstOutputPts!!) * outputRate + 500_000) / 1_000_000
+                            continuity.accept(position, pcm, System.nanoTime()).forEach(::writePcm)
+                            updateContinuityCounters()
                         }
                     } else break
                 }
@@ -259,6 +301,13 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                         output.play(); trackPlaying = true
                     }
                     updatePlaybackState()
+                }
+                if (trackPlaying && audible()) {
+                    val lowWater = maxOf(outputRate * 4 / 1000 + baselineFrames / 2,
+                        AudioSampleClock.SAMPLES_PER_PACKET * outputRate / AudioSampleClock.SAMPLE_RATE)
+                    continuity.protectBuffer((writtenFrames - trackPlayedFrames).coerceAtLeast(0), lowWater,
+                        System.nanoTime(), lastPacketAtNs)?.let(::writePcm)
+                    updateContinuityCounters()
                 }
                 if (frame == null) Thread.sleep(2)
             }

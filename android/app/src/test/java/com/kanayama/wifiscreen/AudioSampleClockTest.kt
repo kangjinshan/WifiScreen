@@ -2,8 +2,6 @@ package com.kanayama.wifiscreen
 
 import org.junit.Assert.*
 import org.junit.Test
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 class AudioSampleClockTest {
     @Test fun timestampWrapAndMissingPacketsKeepMediaTime() {
@@ -51,15 +49,5 @@ class AudioSampleClockTest {
         clock.reset()
         assertEquals(0L, clock.position(123, 900000))
         assertEquals(480L, clock.position(124, 910000))
-    }
-    @Test fun shortConcealmentHasCorrectDurationAndFadesToSilence() {
-        val pcm = PcmGap.silenceWithFade(480, shortArrayOf(12000, -12000))
-        assertEquals(1920, pcm.size)
-        val b = ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN)
-        assertTrue(b.getShort(0) in 1..12000)
-        assertEquals(0, b.getShort(252).toInt())
-        assertEquals(0, b.getShort(1918).toInt())
-        PcmGap.fadeIn(pcm, 2)
-        assertEquals(0, b.getShort(0).toInt())
     }
 }

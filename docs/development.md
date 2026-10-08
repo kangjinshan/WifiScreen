@@ -54,6 +54,8 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 | `LegacyVideo.kt` / `VideoInputQueue.kt` | 硬件视频解码、输入背压与显示 |
 | `LegacyAudio.kt` / `AudioRtpQueue.kt` | 音频解码、播放与 RTP 排队 |
 | `PlaybackTiming.kt` / `AudioSampleClock.kt` | 媒体时间、缓冲与播放节奏 |
+| `AudioContinuity.kt` / `PcmConcealer.kt` | 有限波形补偿、迟到 PCM 去重和缺口接续 |
+| `AvPlaybackClock.kt` | AudioTrack 播放进度与源媒体时间映射、音画同步跳时 |
 | `VideoViewport.kt` / `ReceiverName.kt` | 画面几何、名称校验与协议转义 |
 
 上述文件位于 `android/app/src/main/java/com/kanayama/wifiscreen/`。`NativeReceiver` / `WfdSession` 为早期 Miracast 实验代码，当前主界面使用 `LegacyReceiver`。
@@ -85,6 +87,12 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 
 4 帧限制只约束应用队列，不能单独约束手机、TCP 或硬件解码器的缓冲；主动追帧用于消化已接收的积压。画质与发送端帧率保持原值，持续解码能力不足时仍需实机定位瓶颈。
 
+0.2.4 将短缺口的静音填充替换为波形补偿：用最近 40ms PCM 历史匹配相近周期，保持声道相位并在恢复时用约 3ms 交叉淡化接回真实音频。这段历史不增加播放等待。每次连续缺数据最多补偿 20ms，用尽预算时逐渐淡出；包迟到或缓冲接近空时按约 5ms 补充，正常的解码器批量输出不单独触发补音。迟到 PCM 中已补偿的样本不再重复播放，避免累计延迟。
+
+超过补偿范围的缺口在下一段 PCM 到达后直接接续，保留 AudioTrack 和已排队数据，不再清空重建播放器。播放时间映射记录每段 PCM 对应的源样本位置，视频在播放头到达接续点时跳过同一缺失区间的显示，参考帧仍完整解码。视频优先跟随 AudioTrack 的硬件播放时间戳，设备未提供有效时间戳时使用播放头估计；没有可用音频、时间戳不可靠或音频长时间停滞时，回退到独立的视频节奏，单次等待有 200ms 上限。
+
+当前旧投屏协议的音频 RTP 时间戳并非始终可用，初始音画偏移通过接收端到达时间估计，播放头间隔内仅做有界插值。这不是外部测量的绝对口型同步。持续断流仍可能出现空缺；波形补偿不能还原已经丢失的内容。
+
 ## 诊断与实时速率
 
 应用在前台时提供固定只读地址：
@@ -99,6 +107,8 @@ http://电视IP:47110/status
 0.2.2 新增 `audioPlaying`（AudioTrack 已启动）、`audioPlayedFrames`（播放头累计推进的样本帧）和 `audioTimestampFallbacks`（采用固定帧长兼容的次数）。`audioPcmBytes` 只表示写入缓冲的数据量；即使持续增长，也不证明已开始播放。系统音量和实际扬声器听感仍需另行确认。
 
 0.2.3 新增 `videoCatchingUp` 和 `videoReceiverLatencyMs`。后者测量最近显示帧从应用完整接收至交给 Surface 显示的时间，包含应用排队、解码和等待，不包含此前的手机采集、网络/TCP 积压及之后的显示器处理。无法匹配 OEM 解码器输出时间戳时返回 -1，不推测耗时。
+
+0.2.4 新增 `audioDecodedSamples`、`audioStarvationSamples`、`audioSkippedSamples`、`audioOverlapSamples`，区分解码、临时补音、跳过缺口与去重样本；`audioConcealedSamples` 统计插入的波形补偿样本。`audioHardwareClock` 标识经新鲜度、进度和位置差校验后的硬件时间戳是否有效，`audioHardwareLagMs` 便于识别设备异常时间戳；`videoUsingAudioClock`、`videoAudioSkewMs`、`videoAudioSyncDrops` 显示音频时钟是否生效及同步处理情况。模拟器欠载与实际听感分别验收，不以补偿计数代替原始丢包统计。
 
 实时速率每秒刷新：
 

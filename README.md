@@ -6,7 +6,7 @@
 
 **[下载最新版 APK](https://github.com/kangjinshan/WifiScreen/releases/latest)** · [查看更新](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
-主干源码已更新至 **0.2.3**，包含 Redmi 无声修复和视频积压时的低延迟追帧。GitHub Releases 目前仍为 0.2.1，尚未发布包含这些修复的 APK。
+主干源码已更新至 **0.2.4**，包含短音频缺口的波形补偿、音频与视频同步接续，以及此前的 Redmi 无声和低延迟追帧修复。GitHub Releases 目前仍为 0.2.1，尚未发布包含这些修复的 APK。
 
 ![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
@@ -105,6 +105,8 @@
 检查电视音量，以及投屏菜单是否开启了静音。只有手机系统允许捕获的声音才能传到电视；不同手机系统和正在使用的 App 可能有不同限制。
 
 0.2.2 修复了部分发送端音频时间戳不兼容、反复清空播放缓冲导致无声的问题。新版诊断会区分音频已接收与播放已启动；计数器不能代替实际听感确认。
+
+0.2.4 对短暂缺口使用附近波形补偿、平滑接回真实音频；较长缺口接续时同步调整视频显示。持续断流仍可能听出中断，缺失的原始声音无法完整还原。
 
 </details>
 

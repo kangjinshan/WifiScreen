@@ -12,7 +12,8 @@ import java.util.concurrent.atomic.AtomicLong
 class LegacyVideo(
     private val surface: () -> Surface?,
     private val firstFrame: (Int, Int) -> Unit,
-    private val error: (String) -> Unit
+    private val error: (String) -> Unit,
+    private val playbackClock: AvPlaybackClock? = null
 ) {
     private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long,
         var accessUnit: ByteArray? = null)
@@ -22,6 +23,11 @@ class LegacyVideo(
     val decoded = AtomicLong()
     val presented = AtomicLong()
     val dropped = AtomicLong()
+    val audioSyncDrops = AtomicLong()
+    @Volatile var usingAudioClock = false
+        private set
+    @Volatile var audioSkewMs = 0L
+        private set
     val keyframes = AtomicLong()
     @Volatile var catchingUp = false
         private set
@@ -70,6 +76,8 @@ class LegacyVideo(
             configuredSurface = null
             awaitingKeyframe = true
             presentationClock.reset()
+            playbackClock?.resetVideo()
+            usingAudioClock = false; audioSkewMs = 0
             inputArrivals.clear(); inFlight = 0
             catchingUp = false; receiverLatencyMs = -1
             decoderState = "等待关键帧"
@@ -140,6 +148,7 @@ class LegacyVideo(
                                 if (buffer.remaining() < unit.size) throw IllegalArgumentException("Video input buffer too small")
                                 buffer.put(unit)
                                 codec!!.queueInputBuffer(index, 0, unit.size, frame.timeUs, 0)
+                                playbackClock?.observeVideo(frame.timeUs, input.receivedNs)
                                 inputArrivals.getOrPut(frame.timeUs) { java.util.ArrayDeque() }.addLast(input.receivedNs)
                                 inFlight++
                                 progressed = true
@@ -174,11 +183,37 @@ class LegacyVideo(
                                 first.value.pollFirst()
                                 if (first.value.isEmpty()) inputArrivals.remove(first.key)
                             }
-                            catchingUp = hasBacklog()
-                            var targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime(), catchingUp)
+                            val nowNs = System.nanoTime()
+                            var audioTarget = if (receivedNs != null && (usingAudioClock || !hasBacklog()))
+                                playbackClock?.videoTargetNs(info.presentationTimeUs, nowNs) else null
+                            usingAudioClock = audioTarget != null
+                            audioSkewMs = audioTarget?.let { (it - nowNs) / 1_000_000L } ?: 0
+                            catchingUp = if (usingAudioClock) audioSkewMs < -40 else hasBacklog()
+                            var targetNs = if (audioTarget != null) {
+                                if (audioSkewMs < -40 || playbackClock?.videoWasSkipped(info.presentationTimeUs, nowNs) == true) {
+                                    audioSyncDrops.incrementAndGet(); null
+                                } else maxOf(audioTarget, nowNs)
+                            } else presentationClock.presentationTime(info.presentationTimeUs, nowNs, catchingUp)
                             if (targetNs != null) {
                                 while (running && targetNs!! > System.nanoTime()) {
-                                    if (hasBacklog()) {
+                                    if (System.nanoTime() - nowNs >= 200_000_000L) {
+                                        usingAudioClock = false; targetNs = System.nanoTime(); break
+                                    }
+                                    if (usingAudioClock) {
+                                        val clockNow = System.nanoTime()
+                                        audioTarget = playbackClock?.videoTargetNs(info.presentationTimeUs, clockNow)
+                                        if (audioTarget == null) {
+                                            usingAudioClock = false
+                                            targetNs = presentationClock.presentationTime(info.presentationTimeUs, clockNow, hasBacklog())
+                                            if (targetNs == null) break
+                                        } else {
+                                            audioSkewMs = (audioTarget - clockNow) / 1_000_000L
+                                            if (audioSkewMs < -40 || playbackClock?.videoWasSkipped(info.presentationTimeUs, clockNow) == true) {
+                                                audioSyncDrops.incrementAndGet(); targetNs = null; break
+                                            }
+                                            targetNs = maxOf(audioTarget, clockNow)
+                                        }
+                                    } else if (hasBacklog()) {
                                         catchingUp = true
                                         targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime(), true)
                                         break
