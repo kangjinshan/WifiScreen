@@ -89,8 +89,35 @@ class AvPlaybackClockTest {
         clock.observeAudio(0, 0); clock.appendAudio(0, 4800)
         clock.updateAudio(0, 100_000_000, true)
         assertEquals(100_000_000L, clock.videoTargetNs(2_000_000, 100_000_000))
-        assertTrue(clock.videoTargetNs(1_000_000, 100_000_000)!! < 0)
+        assertNull(clock.videoTargetNs(1_000_000, 100_000_000))
         assertNull(clock.videoTargetNs(3_000_000, 100_000_000))
+    }
+    @Test fun largeNegativeClockOffsetCannotDiscardAllFollowingPictures() {
+        val clock = AvPlaybackClock()
+        clock.resetAudio(48000); clock.observeAudio(0, 0)
+        clock.observeVideo(0, 0); clock.appendAudio(0, 48000 * 30)
+        val fallback = VideoPresentationClock()
+        fallback.observeInput(0, 0)
+        var rendered = 0
+        repeat(30) { i ->
+            val now = 26_000_000_000L + i * 33_333_000L
+            val pts = i * 33333L
+            clock.observeVideo(pts, now); clock.observeVideoOutput(pts)
+            clock.updateAudio(48000L * 26 + i * 1600L, now, true)
+            val target = clock.videoTargetNs(pts, now)
+            assertNull(target)
+            if (fallback.presentationTime(pts, now) != null) rendered++
+        }
+        assertTrue(rendered >= 25)
+        assertEquals(30L, clock.rejectedOffsets)
+        assertTrue(clock.lastOffsetMs < -25000)
+    }
+    @Test fun smallNegativeOffsetsStillAllowNormalAudioSynchronization() {
+        val clock = AvPlaybackClock()
+        clock.resetAudio(48000); clock.observeAudio(0, 0); clock.observeVideo(0, 0)
+        clock.appendAudio(0, 48000); clock.updateAudio(4800, 200_000_000, true)
+        assertEquals(100_000_000L, clock.videoTargetNs(0, 200_000_000))
+        assertEquals(0L, clock.rejectedOffsets)
     }
     @Test fun longSessionsDoNotOverflowTheSampleToNanosecondConversion() {
         val clock = AvPlaybackClock()

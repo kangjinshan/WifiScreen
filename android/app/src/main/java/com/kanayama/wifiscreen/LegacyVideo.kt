@@ -24,6 +24,8 @@ class LegacyVideo(
     val presented = AtomicLong()
     val dropped = AtomicLong()
     val audioSyncDrops = AtomicLong()
+    val audioClockRejections: Long get() = playbackClock?.rejectedOffsets ?: 0
+    val audioClockOffsetMs: Long get() = playbackClock?.lastOffsetMs ?: 0
     @Volatile var usingAudioClock = false
         private set
     @Volatile var audioSkewMs = 0L

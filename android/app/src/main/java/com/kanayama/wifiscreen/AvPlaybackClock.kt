@@ -26,6 +26,10 @@ class AvPlaybackClock {
     private var lastVideoOutputPtsUs: Long? = null
     private var videoTimestampReliable = true
     private var reportedAudioNs = Long.MIN_VALUE
+    @Volatile var rejectedOffsets = 0L
+        private set
+    @Volatile var lastOffsetMs = 0L
+        private set
     private fun sampleTimeNs(sample: Long): Long = sample / rate * 1_000_000_000L +
         sample % rate * 1_000_000_000L / rate
 
@@ -95,9 +99,13 @@ class AvPlaybackClock {
         val audioNs = maxOf(reportedAudioNs, audioOrigin + sampleTimeNs(sample))
         reportedAudioNs = audioNs
         val skew = videoOrigin + ptsUs * 1000 - audioNs
+        lastOffsetMs = skew / 1_000_000L
         // The legacy protocol has no trustworthy common timestamp on every sender.
         // Do not build seconds of delay from a bad anchor or an absent audio stream.
-        if (skew > 200_000_000L) return null
+        if (skew !in -200_000_000L..200_000_000L) {
+            rejectedOffsets++
+            return null
+        }
         return nowNs + skew
     }
     @Synchronized fun videoWasSkipped(ptsUs: Long, nowNs: Long): Boolean {

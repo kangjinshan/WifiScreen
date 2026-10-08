@@ -280,6 +280,8 @@ class LegacyReceiver(
                             .put("videoUsingAudioClock", current?.decoder?.usingAudioClock ?: false)
                             .put("videoAudioSkewMs", current?.decoder?.audioSkewMs ?: 0)
                             .put("videoAudioSyncDrops", current?.decoder?.audioSyncDrops?.get() ?: 0)
+                            .put("videoAudioClockRejections", current?.decoder?.audioClockRejections ?: 0)
+                            .put("videoAudioClockOffsetMs", current?.decoder?.audioClockOffsetMs ?: 0)
                             .put("videoBackpressureWaits", current?.decoder?.backpressureWaits ?: 0)
                             .put("videoKeyframes", current?.decoder?.keyframes?.get() ?: 0)
                             .put("videoOutputAgeMs", current?.decoder?.outputAgeMs ?: -1)
