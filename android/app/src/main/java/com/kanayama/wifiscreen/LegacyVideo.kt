@@ -64,8 +64,8 @@ class LegacyVideo(
         var awaitingKeyframe = true
         var announced = false
         var pending: Input? = null
-        val inputArrivals = linkedMapOf<Long, java.util.ArrayDeque<Long>>()
-        var inFlight = 0
+        val inputArrivals = VideoFrameTracker()
+        var lastCodecActivityNs = 0L
         val presentationClock = VideoPresentationClock()
         val info = MediaCodec.BufferInfo()
         fun release() {
@@ -78,19 +78,20 @@ class LegacyVideo(
             presentationClock.reset()
             playbackClock?.resetVideo()
             usingAudioClock = false; audioSkewMs = 0
-            inputArrivals.clear(); inFlight = 0
+            inputArrivals.clear(); lastCodecActivityNs = 0
             catchingUp = false; receiverLatencyMs = -1
             decoderState = "等待关键帧"
         }
-        // Allow the hardware codec's normal pipeline. An old source timestamp
-        // alone does not mean removable queueing, especially on OEM decoders.
-        fun hasBacklog(): Boolean = queue.size >= 2 || inFlight > 4
+        // OEM codecs may combine input units or omit output callbacks. The
+        // input-minus-output total is not a live queue and must not gate sync.
+        fun hasBacklog(): Boolean = queue.size >= 2
         try {
             while (running) {
                 var progressed = false
-                // Sleep on incoming data when the codec is empty, but never
-                // delay draining pending output. This also leaves CPU for audio.
-                val input = pending ?: queue.poll(if (codec == null || inFlight == 0) 5 else 0)
+                // Poll promptly after actual codec activity; idle input metadata
+                // must not keep this thread spinning forever.
+                val input = pending ?: queue.poll(if (codec == null ||
+                    System.nanoTime() - lastCodecActivityNs >= 10_000_000L) 5 else 0)
                 pending = null
                 if (input != null) {
                     val frame = input.frame
@@ -149,8 +150,8 @@ class LegacyVideo(
                                 buffer.put(unit)
                                 codec!!.queueInputBuffer(index, 0, unit.size, frame.timeUs, 0)
                                 playbackClock?.observeVideo(frame.timeUs, input.receivedNs)
-                                inputArrivals.getOrPut(frame.timeUs) { java.util.ArrayDeque() }.addLast(input.receivedNs)
-                                inFlight++
+                                inputArrivals.record(frame.timeUs, input.receivedNs)
+                                lastCodecActivityNs = System.nanoTime()
                                 progressed = true
                                 awaitingKeyframe = false
                             } else {
@@ -172,17 +173,9 @@ class LegacyVideo(
                         val index = current.dequeueOutputBuffer(info, 0)
                         if (index >= 0) {
                             progressed = true
-                            inFlight = (inFlight - 1).coerceAtLeast(0)
-                            val arrivals = inputArrivals[info.presentationTimeUs]
-                            val receivedNs = arrivals?.pollFirst()
-                            if (arrivals?.isEmpty() == true) inputArrivals.remove(info.presentationTimeUs)
-                            if (receivedNs == null && inputArrivals.isNotEmpty()) {
-                                // Some OEM codecs rewrite timestamps. Do not report
-                                // a guessed latency, and keep tracking bounded.
-                                val first = inputArrivals.entries.first()
-                                first.value.pollFirst()
-                                if (first.value.isEmpty()) inputArrivals.remove(first.key)
-                            }
+                            lastCodecActivityNs = System.nanoTime()
+                            val receivedNs = inputArrivals.take(info.presentationTimeUs)
+                            playbackClock?.observeVideoOutput(info.presentationTimeUs)
                             val nowNs = System.nanoTime()
                             var audioTarget = if (receivedNs != null && (usingAudioClock || !hasBacklog()))
                                 playbackClock?.videoTargetNs(info.presentationTimeUs, nowNs) else null

@@ -26,9 +26,11 @@ class AudioContinuityTest {
         val audio = AudioContinuity(44100, 2)
         repeat(100) { i ->
             val pcm = tone(i * 480, 480)
-            val blocks = audio.accept(i * 480L, pcm, i * 480L * 1_000_000_000 / 44100)
+            val original = pcm.copyOf()
+            val blocks = audio.accept(i * 480L, pcm)
             assertEquals(1, blocks.size)
-            assertArrayEquals(pcm, blocks.single().data)
+            assertArrayEquals(original, blocks.single().data)
+            assertArrayEquals(original, pcm)
         }
         assertEquals(0, audio.concealedSamples)
         assertEquals(0, audio.skippedSamples)
@@ -36,8 +38,8 @@ class AudioContinuityTest {
     }
     @Test fun lostPacketContinuesWaveformInsteadOfAddingFlatSilence() {
         val audio = AudioContinuity(44100, 2)
-        audio.accept(0, tone(0, 960), 0)
-        val blocks = audio.accept(1440, tone(1440, 480), 33_000_000)
+        audio.accept(0, tone(0, 960))
+        val blocks = audio.accept(1440, tone(1440, 480))
         assertEquals(listOf(960L, 1440L), blocks.map { it.mediaSample })
         val repair = blocks.first().data
         assertEquals(1920, repair.size)
@@ -70,54 +72,47 @@ class AudioContinuityTest {
     }
     @Test fun longGapJoinsNextAudioWithoutResettingOrWritingItsMissingDuration() {
         val audio = AudioContinuity(44100, 2)
-        audio.accept(0, tone(0, 960), 0)
-        val blocks = audio.accept(5760, tone(5760, 480), 130_000_000)
+        audio.accept(0, tone(0, 960))
+        val blocks = audio.accept(5760, tone(5760, 480))
         assertEquals(1, blocks.size)
         assertEquals(5760L, blocks.single().mediaSample)
         assertEquals(1920, blocks.single().data.size)
         assertEquals(4800, audio.skippedSamples)
         assertEquals(0, audio.concealedSamples)
     }
-    @Test fun starvationRepairIsBoundedAndLatePcmCannotReplayThoseSamples() {
+    @Test fun duplicateDecodedAudioCannotPlayTwice() {
         val audio = AudioContinuity(44100, 2)
-        audio.accept(0, tone(0, 960), 0)
-        assertNull(audio.protectBuffer(0, 1200, 10_000_000, 0))
-        assertNull(audio.protectBuffer(2000, 1200, 16_000_000, 0))
-        val repairs = (0..3).map { audio.protectBuffer(100, 1200, 16_000_000L + it * 2_000_000L, 0)!! }
-        assertTrue(repairs.all { it.data.size <= 221 * 4 })
-        assertEquals(882 * 4, repairs.sumOf { it.data.size })
-        assertNull(audio.protectBuffer(0, 1200, 40_000_000, 0))
-        assertTrue(audio.accept(960, tone(960, 480), 41_000_000).isEmpty())
-        val recovered = audio.accept(1440, tone(1440, 480), 42_000_000).single()
-        assertEquals(1842L, recovered.mediaSample)
-        assertEquals(78 * 4, recovered.data.size)
-        assertEquals(882, audio.overlapSamples)
-        assertEquals(882, audio.starvationSamples)
+        audio.accept(0, tone(0, 480))
+        assertTrue(audio.accept(0, tone(0, 480)).isEmpty())
+        val next = tone(480, 480)
+        assertArrayEquals(next, audio.accept(480, next.copyOf()).single().data)
+        assertEquals(480L, audio.overlapSamples)
+        assertEquals(0L, audio.concealedSamples)
     }
     @Test fun silentInputDoesNotInventAHighEnergyTone() {
         val audio = AudioContinuity(44100, 2)
-        audio.accept(0, ByteArray(960 * 4), 0)
-        val repaired = audio.accept(1440, ByteArray(480 * 4), 33_000_000).first().data
+        audio.accept(0, ByteArray(960 * 4))
+        val repaired = audio.accept(1440, ByteArray(480 * 4)).first().data
         assertTrue(repaired.all { it == 0.toByte() })
     }
     @Test fun noHistoryDoesNotCreateArtificialPreroll() {
         val audio = AudioContinuity(44100, 1)
-        assertNull(audio.protectBuffer(0, 1000, 1_000_000_000, 0))
-        assertEquals(1, audio.accept(4800, ByteArray(480 * 2), 1_000_000_000).size)
+        assertEquals(1, audio.accept(4800, ByteArray(480 * 2)).size)
         assertEquals(0, audio.concealedSamples)
     }
-    @Test fun batchedDecoderOutputWithFreshPacketsIsNotAnAudioLoss() {
+    @Test fun completeBatchesNeverInsertSyntheticAudioOrDiscardRealSamples() {
         val audio = AudioContinuity(44100, 2)
-        audio.accept(0, tone(0, 960), 0)
-        assertNull(audio.protectBuffer(500, 1200, 20_000_000, 18_000_000))
-        assertNull(audio.protectBuffer(500, 1200, 30_000_000, 28_000_000))
-        assertEquals(0L, audio.starvationSamples)
-    }
-    @Test fun almostEmptyPlaybackCanBridgeLateDecoderOutputDespiteFreshRtp() {
-        val audio = AudioContinuity(44100, 2)
-        audio.accept(0, tone(0, 960), 0)
-        val repair = audio.protectBuffer(0, 1200, 20_000_000, 19_000_000)!!
-        assertEquals(221 * 4, repair.data.size)
-        assertTrue(energy(repair.data) > 1000000)
+        var position = 0
+        repeat(200) { i ->
+            val count = if (i % 3 == 0) 960 else 480
+            val pcm = tone(position, count)
+            val blocks = audio.accept(position.toLong(), pcm.copyOf())
+            assertEquals(1, blocks.size)
+            assertArrayEquals(pcm, blocks.single().data)
+            position += count
+        }
+        assertEquals(0L, audio.concealedSamples)
+        assertEquals(0L, audio.overlapSamples)
+        assertEquals(0L, audio.skippedSamples)
     }
 }

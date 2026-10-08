@@ -18,13 +18,13 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
     private val queue = AudioRtpQueue()
     private val sampleClock = AudioSampleClock()
     @Volatile private var running = true
-    @Volatile private var lastPacketAtNs = 0L
     @Volatile var volume = 0.7f
     val packets = AtomicLong()
     val pcmBytes = AtomicLong()
     val decodedSamples = AtomicLong()
     val inputRetries = AtomicLong()
     val concealedSamples = AtomicLong()
+    // Retain the diagnostic field for older clients; predictive replacement is disabled.
     val starvationSamples = AtomicLong()
     val skippedSamples = AtomicLong()
     val overlapSamples = AtomicLong()
@@ -66,7 +66,6 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         packets.incrementAndGet()
         if (!running || !audible() || !ready) return
         val receivedNs = System.nanoTime()
-        lastPacketAtNs = receivedNs
         val header = ByteBuffer.wrap(rtp)
         queue.offer(AudioRtpFrame(header.getShort(2).toInt() and 65535,
             header.getInt(4).toLong() and 0xffffffffL, data,
@@ -97,7 +96,6 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         var savedUnderruns = 0
         var continuity = AudioContinuity(outputRate, outputChannels)
         var countedConcealed = 0L
-        var countedStarvation = 0L
         var countedSkipped = 0L
         var countedOverlap = 0L
         var prerollBytes = 0
@@ -108,16 +106,15 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
 
         fun updateContinuityCounters() {
             concealedSamples.addAndGet(continuity.concealedSamples - countedConcealed)
-            starvationSamples.addAndGet(continuity.starvationSamples - countedStarvation)
             skippedSamples.addAndGet(continuity.skippedSamples - countedSkipped)
             overlapSamples.addAndGet(continuity.overlapSamples - countedOverlap)
-            countedConcealed = continuity.concealedSamples; countedStarvation = continuity.starvationSamples
+            countedConcealed = continuity.concealedSamples
             countedSkipped = continuity.skippedSamples; countedOverlap = continuity.overlapSamples
         }
         fun resetContinuity() {
             updateContinuityCounters()
             continuity = AudioContinuity(outputRate, outputChannels)
-            countedConcealed = 0; countedStarvation = 0; countedSkipped = 0; countedOverlap = 0
+            countedConcealed = 0; countedSkipped = 0; countedOverlap = 0
             playbackClock.resetAudio(outputRate)
         }
 
@@ -291,7 +288,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                             decodedSamples.addAndGet((pcm.size / (outputChannels * 2)).toLong())
                             if (firstOutputPts == null) firstOutputPts = info.presentationTimeUs
                             val position = ((info.presentationTimeUs - firstOutputPts!!) * outputRate + 500_000) / 1_000_000
-                            continuity.accept(position, pcm, System.nanoTime()).forEach(::writePcm)
+                            continuity.accept(position, pcm).forEach(::writePcm)
                             updateContinuityCounters()
                         }
                     } else break
@@ -301,13 +298,6 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                         output.play(); trackPlaying = true
                     }
                     updatePlaybackState()
-                }
-                if (trackPlaying && audible()) {
-                    val lowWater = maxOf(outputRate * 4 / 1000 + baselineFrames / 2,
-                        AudioSampleClock.SAMPLES_PER_PACKET * outputRate / AudioSampleClock.SAMPLE_RATE)
-                    continuity.protectBuffer((writtenFrames - trackPlayedFrames).coerceAtLeast(0), lowWater,
-                        System.nanoTime(), lastPacketAtNs)?.let(::writePcm)
-                    updateContinuityCounters()
                 }
                 if (frame == null) Thread.sleep(2)
             }

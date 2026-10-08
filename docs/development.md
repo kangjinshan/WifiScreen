@@ -56,6 +56,7 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 | `PlaybackTiming.kt` / `AudioSampleClock.kt` | 媒体时间、缓冲与播放节奏 |
 | `AudioContinuity.kt` / `PcmConcealer.kt` | 有限波形补偿、迟到 PCM 去重和缺口接续 |
 | `AvPlaybackClock.kt` | AudioTrack 播放进度与源媒体时间映射、音画同步跳时 |
+| `VideoFrameTracker.kt` | 有界的视频输入时间记录，兼容一个画面由多个输入单元组成 |
 | `VideoViewport.kt` / `ReceiverName.kt` | 画面几何、名称校验与协议转义 |
 
 上述文件位于 `android/app/src/main/java/com/kanayama/wifiscreen/`。`NativeReceiver` / `WfdSession` 为早期 Miracast 实验代码，当前主界面使用 `LegacyReceiver`。
@@ -92,6 +93,10 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 超过补偿范围的缺口在下一段 PCM 到达后直接接续，保留 AudioTrack 和已排队数据，不再清空重建播放器。播放时间映射记录每段 PCM 对应的源样本位置，视频在播放头到达接续点时跳过同一缺失区间的显示，参考帧仍完整解码。视频优先跟随 AudioTrack 的硬件播放时间戳，设备未提供有效时间戳时使用播放头估计；没有可用音频、时间戳不可靠或音频长时间停滞时，回退到独立的视频节奏，单次等待有 200ms 上限。
 
 当前旧投屏协议的音频 RTP 时间戳并非始终可用，初始音画偏移通过接收端到达时间估计，播放头间隔内仅做有界插值。这不是外部测量的绝对口型同步。持续断流仍可能出现空缺；波形补偿不能还原已经丢失的内容。
+
+0.2.5 禁用 0.2.4 的预测式补音。真实设备和成对发包回归表明，即使没有丢包，该策略仍可能大量替换正常音频，产生杂音。现在只有排序后媒体样本位置的缺口才允许修改 PCM；连续输入逐字节保留，短缺口有限补偿，长缺口平滑接续。`audioStarvationSamples` 为兼容旧诊断保留，固定为 0。
+
+0.2.5 也不再用累计输入数减输出数判断视频积压。部分编码器会拆分输入、部分硬件解码器会合并或省略输出，累计差值不代表待显示画面。追帧只参考实际应用队列；时间记录最多保留 64 项，同一时间戳的多个输入单元在画面输出时一起移除。时间戳可靠性按解码输出检查，避免重复的输入分片关闭音画同步。
 
 ## 诊断与实时速率
 

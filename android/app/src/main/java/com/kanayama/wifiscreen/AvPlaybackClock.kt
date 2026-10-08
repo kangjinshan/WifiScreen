@@ -23,6 +23,7 @@ class AvPlaybackClock {
     private var audioOriginNs: Long? = null
     private var videoOriginNs: Long? = null
     private var lastVideoPtsUs: Long? = null
+    private var lastVideoOutputPtsUs: Long? = null
     private var videoTimestampReliable = true
     private var reportedAudioNs = Long.MIN_VALUE
     private fun sampleTimeNs(sample: Long): Long = sample / rate * 1_000_000_000L +
@@ -32,13 +33,18 @@ class AvPlaybackClock {
         rate = sampleRate; written = 0; head = 0; headAtNs = 0; started = false
         audioOriginNs = null; spans.clear(); skips.clear(); reportedAudioNs = Long.MIN_VALUE
     }
-    @Synchronized fun resetVideo() { videoOriginNs = null; lastVideoPtsUs = null; videoTimestampReliable = true }
+    @Synchronized fun resetVideo() {
+        videoOriginNs = null; lastVideoPtsUs = null; lastVideoOutputPtsUs = null; videoTimestampReliable = true
+    }
     @Synchronized fun observeVideo(ptsUs: Long, receivedNs: Long) {
-        videoTimestampReliable = lastVideoPtsUs?.let { ptsUs != it } ?: true
         if (lastVideoPtsUs?.let { ptsUs < it } == true) videoOriginNs = null
         val candidate = receivedNs - ptsUs * 1000
         videoOriginNs = minOf(videoOriginNs ?: candidate, candidate)
         lastVideoPtsUs = ptsUs
+    }
+    @Synchronized fun observeVideoOutput(ptsUs: Long) {
+        videoTimestampReliable = lastVideoOutputPtsUs?.let { ptsUs != it } ?: true
+        lastVideoOutputPtsUs = ptsUs
     }
     @Synchronized fun observeAudio(mediaSample: Long, receivedNs: Long) {
         val candidate = receivedNs - sampleTimeNs(mediaSample)

@@ -107,8 +107,18 @@ class AvPlaybackClockTest {
         clock.observeAudio(0, 0); clock.appendAudio(0, 4410)
         clock.updateAudio(441, 100_000_000, true)
         clock.observeVideo(0, 0); clock.observeVideo(0, 33_000_000)
+        clock.observeVideoOutput(0); clock.observeVideoOutput(0)
         assertNull(clock.videoTargetNs(0, 100_000_000))
         clock.observeVideo(33_000, 66_000_000)
+        clock.observeVideoOutput(33_000)
         assertNotNull(clock.videoTargetNs(33_000, 100_000_000))
+    }
+    @Test fun multipleInputSlicesDoNotDisableAudioSyncForOneDecodedPicture() {
+        val clock = AvPlaybackClock()
+        clock.observeAudio(0, 0); clock.appendAudio(0, 4410)
+        clock.updateAudio(441, 100_000_000, true)
+        repeat(4) { clock.observeVideo(0, it * 1000L) }
+        clock.observeVideoOutput(0)
+        assertNotNull(clock.videoTargetNs(0, 100_000_000))
     }
 }
