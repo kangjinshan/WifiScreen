@@ -1,9 +1,10 @@
 <resources>
     <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
-        <item name="android:windowBackground">#101927</item>
-        <item name="android:colorAccent">#75DBC4</item>
+        <item name="android:windowBackground">#101214</item>
+        <item name="android:colorAccent">#F2BD66</item>
+        <item name="colorAccent">#F2BD66</item>
         <item name="android:fontFamily">sans-serif</item>
-        <item name="android:textColorPrimary">#EDF4FA</item>
-        <item name="android:textColorSecondary">#A7B9CC</item>
+        <item name="android:textColorPrimary">#F6F2E9</item>
+        <item name="android:textColorSecondary">#B5B1A9</item>
     </style>
 </resources>

@@ -37,7 +37,11 @@ class LegacyReceiver(
     private val rendered: (Int, Int) -> Unit,
     private val ended: (String) -> Unit
 ) {
-    val name = displayName
+    val name: String get() = identity.getString("display_name", null) ?: displayName
+    val isRunning: Boolean get() = running
+    val isReady: Boolean get() = running && discovery != null
+    @Volatile var muted = false
+        private set
     private val main = Handler(Looper.getMainLooper())
     private val setup = Executors.newSingleThreadExecutor()
     private var workers = Executors.newCachedThreadPool()
@@ -81,7 +85,7 @@ class LegacyReceiver(
         private val focusListener = AudioManager.OnAudioFocusChangeListener { focus ->
             audioAllowed = focus == AudioManager.AUDIOFOCUS_GAIN || focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
             ducked = focus == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
-            sound.volume = userVolume * if (ducked) 0.2f else 1f
+            applyVolume()
         }
         val decoder = LegacyVideo(surface, { width, height ->
             main.post {
@@ -99,7 +103,8 @@ class LegacyReceiver(
         val sound = LegacyAudio({ hasPicture && audioAllowed && !closed }, { failure ->
             if (!closed && active === this) lastError = failure
         })
-        fun volume(value: Float) { userVolume = value; sound.volume = value * if (ducked) 0.2f else 1f }
+        fun applyVolume() { sound.volume = if (muted) 0f else userVolume * if (ducked) 0.2f else 1f }
+        fun volume(value: Float) { userVolume = value; applyVolume() }
         fun report(): String = "接收端：" + name + "\n手机 IP：" + peer +
             "\n时长：" + (SystemClock.elapsedRealtime() - started) / 1000 + " 秒" +
             "\n视频接收：" + decoder.received.get() + " 帧" +
@@ -126,11 +131,15 @@ class LegacyReceiver(
         }
     }
 
-    private fun reportState(text: String) { main.post { if (running) status(text) } }
+    private fun reportState(text: String) {
+        val token = generation
+        main.post { if (running && generation == token) status(text) }
+    }
 
-    @Synchronized fun start() {
+    @Synchronized fun start(preferredAddress: String? = null) {
         if (running) return
-        val ip = DeviceProfile.addresses(context).firstOrNull()
+        val addresses = DeviceProfile.addresses(context)
+        val ip = preferredAddress?.takeIf { it in addresses } ?: addresses.firstOrNull()
         if (ip == null) { status("请先连接 Wi-Fi 或有线网络"); return }
         address = ip
         running = true
@@ -244,7 +253,7 @@ class LegacyReceiver(
                         type = "text/plain; charset=utf-8"
                     }
                     method == "GET" && path == "/status" -> {
-                        val current = active
+                        val current = active?.takeUnless { it.closed }
                         body = JSONObject().put("name", name).put("version", BuildConfig.VERSION_NAME)
                             .put("android", Build.VERSION.RELEASE).put("model", Build.MODEL)
                             .put("controlPort", CONTROL_PORT).put("videoPort", VIDEO_PORT).put("audioPort", AUDIO_PORT)
@@ -252,6 +261,7 @@ class LegacyReceiver(
                             .put("connected", current != null).put("sourceIp", current?.peer ?: "")
                             .put("sessionSeconds", current?.let { (SystemClock.elapsedRealtime() - it.started) / 1000 } ?: 0)
                             .put("ready", running && discovery != null).put("playing", current?.hasPicture == true)
+                            .put("muted", muted)
                             .put("videoReceived", current?.decoder?.received?.get() ?: 0)
                             .put("videoDecoded", current?.decoder?.decoded?.get() ?: 0)
                             .put("videoCodec", current?.decoder?.codecName ?: "")
@@ -289,7 +299,7 @@ class LegacyReceiver(
                     method == "GET" && path == "/server-info" -> {
                         body = plist("<key>deviceid</key><string>" + mac + "</string><key>features</key><integer>1518338039</integer>" +
                             "<key>model</key><string>WifiScreen,1</string><key>protovers</key><string>1.0</string>" +
-                            "<key>srcvers</key><string>220.68</string><key>name</key><string>" + name + "</string><key>vv</key><string>1</string>")
+                            "<key>srcvers</key><string>220.68</string><key>name</key><string>" + ReceiverName.xml(name) + "</string><key>vv</key><string>1</string>")
                         type = "text/x-apple-plist+xml"
                     }
                     method == "GET" && path in listOf("/stream", "/stream.xml") -> {
@@ -305,6 +315,7 @@ class LegacyReceiver(
                             if (active != null && active?.peer != peer) throw IOException("Receiver busy")
                             active?.close()
                             lastError = ""
+                            muted = false
                             session = Session(peer, socket, controlByPeer[peer])
                             active = session
                         }
@@ -353,7 +364,9 @@ class LegacyReceiver(
                 session?.close()
                 if (session != null && active === session) {
                     active = null
-                    main.post { if (running && generation == token) ended("投屏已结束，等待手机重新连接") }
+                    val message = if (lastError.isEmpty()) "投屏已结束，等待手机重新连接"
+                        else "投屏连接中断，请在手机上重新选择设备"
+                    main.post { if (running && generation == token && active == null) ended(message) }
                 }
             }
         }
@@ -375,6 +388,28 @@ class LegacyReceiver(
     fun streamCounters(): StreamCounters? = active?.takeUnless { it.closed }?.let {
         StreamCounters(it.id, it.decoder.presented.get(), it.receivedBytes.get())
     }
+    fun snapshot(): ReceiverSnapshot {
+        val session = active?.takeUnless { it.closed }
+        return ReceiverSnapshot(session?.id ?: 0, session?.peer.orEmpty(), session?.hasPicture == true,
+            session?.decoder?.width ?: 0, session?.decoder?.height ?: 0,
+            session?.decoder?.received?.get() ?: 0, session?.decoder?.decoded?.get() ?: 0,
+            session?.decoder?.queueDepth ?: 0, session?.decoder?.outputAgeMs ?: -1,
+            session?.let { SystemClock.elapsedRealtime() - it.started } ?: 0,
+            session?.sound?.packets?.get() ?: 0, session?.sound?.pcmBytes?.get() ?: 0,
+            session?.sound?.errorMessage.orEmpty(), lastError)
+    }
+    fun mute(value: Boolean) { muted = value; active?.applyVolume() }
+    @Synchronized fun rename(value: String): String? {
+        ReceiverName.error(value)?.let { return it }
+        if (active?.closed == false) return "请先结束投屏再修改设备名称"
+        val updated = value.trim()
+        if (updated == name) return null
+        identity.edit().putString("display_name", updated).apply()
+        val restart = running
+        val previousAddress = address
+        if (restart) { stop(); start(previousAddress) }
+        return null
+    }
     fun report(): String = active?.report() ?: lastReport
     fun diagnostics(): String = "固定诊断地址：http://" + address + ":" + CONTROL_PORT + "/diagnostics\n" +
         "应用在前台时可读取，退出应用后关闭。\n\n" + report() + "\n\n" + deviceReport
@@ -388,7 +423,7 @@ class LegacyReceiver(
         controlByPeer.clear()
         val old = discovery
         discovery = null
-        setup.execute { old?.close() }
+        if (!setup.isShutdown) setup.execute { old?.close() }
         multicast?.let { if (it.isHeld) it.release() }; multicast = null
         workers.shutdownNow()
     }
@@ -403,3 +438,10 @@ class LegacyReceiver(
     }
     private fun plist(dict: String) = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict>" + dict + "</dict></plist>"
 }
+
+data class ReceiverSnapshot(
+    val sessionId: Long, val peer: String, val playing: Boolean,
+    val width: Int, val height: Int, val received: Long, val decoded: Long,
+    val queueDepth: Int, val outputAgeMs: Long, val sessionAgeMs: Long,
+    val audioPackets: Long, val audioPcmBytes: Long, val audioError: String, val error: String
+)
