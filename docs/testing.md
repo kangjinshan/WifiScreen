@@ -9,6 +9,10 @@ cd android
 
 当前 37 项单元测试覆盖 RTSP / RTP、AVC 配置与边界、关键帧处理、旧发送端所需的响应头格式、UTF-8 内容长度，以及解码消费者变慢时保留帧顺序和正常停止。
 
+## Release 工作流回归
+
+在仓库根目录运行 `python3 -m unittest discover -s tests -p test_release_workflow.py -v`。测试直接执行工作流内的发布逻辑，模拟首次发布、重复发布、产物不全、源码或签名不一致，以及 GitHub API 失败；不会访问或修改线上 Release。已有版本重试还需在 Actions 中选择最新 `main` 工作流并填写 `release_tag`，以验证旧标签源码与最新发布逻辑的组合。
+
 ## 视频回归
 
 使用合成 H.264 测试画面通过真实接收 TCP 路径验证，不采集用户画面：

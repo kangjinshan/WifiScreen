@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: android-apk-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -121,7 +125,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APP_VERSION: ${{ steps.apk.outputs.version }}
           RELEASE_TAG: ${{ steps.apk.outputs.release_tag }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "WifiScreen $APP_VERSION" --notes-file .github/release-notes.md
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          tag = os.environ['RELEASE_TAG']
+          version = os.environ['APP_VERSION']
+          existing = subprocess.check_output([
+              'gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/releases',
+              '--paginate', '--jq', '.[] | select(.tag_name == env.RELEASE_TAG)',
+          ], text=True).strip()
+          if existing:
+              release = json.loads(existing)
+              assets = {asset['name']: asset for asset in release['assets']}
+              apk_name = 'wifiscreen-' + version + '.apk'
+              required = (apk_name, 'SHA256SUMS', 'build-info.json')
+              if release['draft'] or any(name not in assets or assets[name]['state'] != 'uploaded'
+                                         or assets[name]['size'] <= 0 for name in required):
+                  raise SystemExit('Existing release is incomplete; inspect it before retrying: ' + tag)
+              published = json.loads(subprocess.check_output([
+                  'gh', 'release', 'download', tag, '--pattern', 'build-info.json', '--output', '-',
+              ], text=True))
+              current = json.loads(Path('dist/build-info.json').read_text())
+              for key in ('package', 'versionCode', 'versionName', 'commit', 'certificateSha256'):
+                  if published[key] != current[key]:
+                      raise SystemExit('Existing release has different ' + key + ': ' + tag)
+              apk = assets[apk_name]
+              if apk['size'] != published['size'] or (apk.get('digest') and
+                      apk['digest'] != 'sha256:' + published['sha256']):
+                  raise SystemExit('Existing APK does not match its build metadata: ' + tag)
+              print('Release already published and verified: ' + release['html_url'])
+          else:
+              subprocess.check_call([
+                  'gh', 'release', 'create', tag, *map(str, sorted(Path('dist').iterdir())),
+                  '--verify-tag', '--title', 'WifiScreen ' + version,
+                  '--notes-file', '.github/release-notes.md',
+              ])
+          PY
       - name: Remove signing files
         if: always()
         run: |

@@ -100,6 +100,7 @@ cd android
 - 推送 `v版本号` 标签，例如 `v0.1.3`，会自动运行测试、Lint、Release 构建，并把 APK 发布到 GitHub Releases。
 - 在 **Actions → Build Android APK → Run workflow** 可手动编译当前分支；完成后从该次运行的 Artifacts 下载。
 - 若某个版本的构建需要重试，可在最新工作流中填写已有的 `release_tag`（如 `v0.1.3`），从该标签源码编译并发布；流程会校验源码提交与标签一致。
+- 重复发布同一版本时，会核对已有 Release 的文件、源码提交、版本和签名；核对通过即成功结束，保留原发布文件。文件不全或信息不一致时会报错，需先检查该 Release。
 - 标签版本必须与 APK 的 `versionName` 一致。版本号和版本码在 `android/app/build.gradle.kts` 中维护。
 
 Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variables → Actions** 配置：
