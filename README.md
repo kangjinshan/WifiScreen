@@ -6,11 +6,11 @@
 
 **[下载已发布版 0.1.4](https://github.com/kangjinshan/WifiScreen/releases/latest)** · [查看更新](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
-![投屏助手首页：在手机投屏列表中选择电视上显示的设备名称](docs/images/home.png)
+![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
-*上图是 0.2.0 的模拟器界面。连接时，请选择你电视首页显示的设备名称；真实设备默认名称为「WifiScreen 投影」，也可以自行修改。*
+*上图是 0.2.1 的模拟器界面。连接时，请选择你电视首页显示的设备名称；真实设备默认名称为「WifiScreen 投影」，也可以自行修改。*
 
-> **下载版本说明：** GitHub 目前已发布的 APK 为 **0.1.4**。上图与下方的遥控器菜单、画面调整、设备改名说明对应 **0.2.0**；这些功能在 0.1.4 中尚不可用。下载前请核对发布页的版本号。
+> **下载版本说明：** GitHub 目前已发布的 APK 为 **0.1.4**。上图与下方的遥控器菜单、画面调整、设备改名说明适用于 **0.2.0 及更新版本**；这些功能在 0.1.4 中尚不可用。下载前请核对发布页的版本号。
 
 ## 先确认你的设备
 
