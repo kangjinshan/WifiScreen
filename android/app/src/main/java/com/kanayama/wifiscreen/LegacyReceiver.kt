@@ -113,7 +113,9 @@ class LegacyReceiver(
             "\n解码状态：" + decoder.decoderState +
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
             "\n接收关键帧：" + decoder.keyframes.get() + "\n距上次视频输出：" + decoder.outputAgeMs + " ms" +
-            "\n音频包：" + sound.packets.get() + "\nPCM 输出：" + sound.pcmBytes.get() + " bytes" +
+            "\n音频包：" + sound.packets.get() + "\nPCM 写入：" + sound.pcmBytes.get() + " bytes" +
+            "\n音频播放已启动：" + sound.playing + "\n实际播放样本：" + sound.playedFrames +
+            "\n音频时间戳兼容回退：" + sound.timestampFallbacks + "\n音频时间轴重置：" + sound.timestampResets.get() +
             "\n音频播放欠载：" + sound.underruns + "\n音频缓冲：" + sound.bufferedMs + " ms" +
             "\n系统原有音频缓冲：" + sound.platformBufferMs + " ms" +
             "\n音频 RTP 缺包 / 乱序：" + sound.missingPackets + " / " + sound.reorderedPackets +
@@ -275,6 +277,9 @@ class LegacyReceiver(
                             .put("videoPresentationDrops", current?.decoder?.dropped?.get() ?: 0)
                             .put("audioPackets", current?.sound?.packets?.get() ?: 0)
                             .put("audioPcmBytes", current?.sound?.pcmBytes?.get() ?: 0)
+                            .put("audioPlaying", current?.sound?.playing ?: false)
+                            .put("audioPlayedFrames", current?.sound?.playedFrames ?: 0)
+                            .put("audioTimestampFallbacks", current?.sound?.timestampFallbacks ?: 0)
                             .put("audioCodec", current?.sound?.codecName ?: "")
                             .put("audioReady", current?.sound?.ready ?: false)
                             .put("audioError", current?.sound?.errorMessage ?: "")
@@ -396,7 +401,7 @@ class LegacyReceiver(
             session?.decoder?.queueDepth ?: 0, session?.decoder?.outputAgeMs ?: -1,
             session?.let { SystemClock.elapsedRealtime() - it.started } ?: 0,
             session?.sound?.packets?.get() ?: 0, session?.sound?.pcmBytes?.get() ?: 0,
-            session?.sound?.errorMessage.orEmpty(), lastError)
+            session?.sound?.errorMessage.orEmpty(), lastError, session?.sound?.playing == true)
     }
     fun mute(value: Boolean) { muted = value; active?.applyVolume() }
     @Synchronized fun rename(value: String): String? {
@@ -443,5 +448,6 @@ data class ReceiverSnapshot(
     val sessionId: Long, val peer: String, val playing: Boolean,
     val width: Int, val height: Int, val received: Long, val decoded: Long,
     val queueDepth: Int, val outputAgeMs: Long, val sessionAgeMs: Long,
-    val audioPackets: Long, val audioPcmBytes: Long, val audioError: String, val error: String
+    val audioPackets: Long, val audioPcmBytes: Long, val audioError: String, val error: String,
+    val audioPlaying: Boolean
 )

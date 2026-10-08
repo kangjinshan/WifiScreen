@@ -14,7 +14,7 @@ class AudioRtpQueue(private val capacity: Int = 32) {
     private var waitingSince: Long? = null
     private var nextExpectedArrivalNs: Long? = null
     private var previousArrivalNs: Long? = null
-    private var previousTimestamp = 0L
+    private var previousSequence = 0
     private var jitterTicks = 0.0
     private var currentSsrc: Long? = null
     @Volatile private var closed = false
@@ -31,6 +31,7 @@ class AudioRtpQueue(private val capacity: Int = 32) {
         if (currentSsrc != null && currentSsrc != frame.ssrc) {
             frames.clear(); seen.clear(); highest = null; expected = null
             waitingSince = null; nextExpectedArrivalNs = null; previousArrivalNs = null; jitterTicks = 0.0
+            jitterMs = 0.0
         }
         currentSsrc = frame.ssrc
         val high = highest
@@ -47,13 +48,15 @@ class AudioRtpQueue(private val capacity: Int = 32) {
         if (high == null || sequence > high) highest = sequence
         if (expected == null) expected = sequence
         previousArrivalNs?.let { arrival ->
-            val timestampDelta = (frame.timestamp - previousTimestamp).toInt().toLong()
-            val arrivalTicks = (nowNs - arrival) * 44100.0 / 1_000_000_000.0
-            jitterTicks += (abs(arrivalTicks - timestampDelta) - jitterTicks) / 16.0
-            jitterMs = jitterTicks * 1000.0 / 44100.0
+            // Use the same negotiated media clock as playback, including signed
+            // sequence deltas for reordered packets and the 16-bit wrap.
+            val mediaTicks = (frame.sequence - previousSequence).toShort().toLong() * AudioSampleClock.SAMPLES_PER_PACKET
+            val arrivalTicks = (nowNs - arrival) * AudioSampleClock.SAMPLE_RATE.toDouble() / 1_000_000_000.0
+            jitterTicks += (abs(arrivalTicks - mediaTicks) - jitterTicks) / 16.0
+            jitterMs = jitterTicks * 1000.0 / AudioSampleClock.SAMPLE_RATE
         }
         previousArrivalNs = nowNs
-        previousTimestamp = frame.timestamp
+        previousSequence = frame.sequence
         if (frames.size >= capacity) { overflowPackets++; return }
         frames[sequence] = frame.copy(receivedNs = nowNs)
     }
@@ -63,7 +66,7 @@ class AudioRtpQueue(private val capacity: Int = 32) {
         val next = expected ?: return null
         frames.remove(next)?.let {
             expected = next + 1; waitingSince = null
-            nextExpectedArrivalNs = it.receivedNs + 480L * 1_000_000_000L / 44100
+            nextExpectedArrivalNs = it.receivedNs + AudioSampleClock.SAMPLES_PER_PACKET * 1_000_000_000L / AudioSampleClock.SAMPLE_RATE
             return it
         }
         // The 20ms budget starts when the missing packet was due, not one packet later
@@ -75,7 +78,7 @@ class AudioRtpQueue(private val capacity: Int = 32) {
         expected = available + 1
         waitingSince = null
         return frames.remove(available)?.also {
-            nextExpectedArrivalNs = it.receivedNs + 480L * 1_000_000_000L / 44100
+            nextExpectedArrivalNs = it.receivedNs + AudioSampleClock.SAMPLES_PER_PACKET * 1_000_000_000L / AudioSampleClock.SAMPLE_RATE
         }
     }
 

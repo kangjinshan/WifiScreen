@@ -43,4 +43,27 @@ class AudioRtpQueueTest {
         assertEquals(0, queue.poll(1_000_000)?.sequence)
         assertEquals(0L, queue.latePackets)
     }
+    @Test fun arrivalJitterDoesNotDependOnNonSampleTimestampUnits() {
+        val standard = AudioRtpQueue()
+        val legacy = AudioRtpQueue()
+        for (i in 0..300) {
+            val sequence = (65530 + i) and 65535
+            val now = i * 480L * 1_000_000_000L / 44100 + (i % 3) * 100_000L
+            standard.offer(AudioRtpFrame(sequence, i * 480L, byteArrayOf(1)), now)
+            legacy.offer(AudioRtpFrame(sequence, i * 10_884L, byteArrayOf(1)), now)
+            standard.poll(now); legacy.poll(now)
+        }
+        assertTrue(standard.jitterMs < 1.0)
+        assertEquals(standard.jitterMs, legacy.jitterMs, 0.0001)
+    }
+    @Test fun sourceRestartClearsPreviousJitterEstimate() {
+        val queue = AudioRtpQueue()
+        queue.offer(AudioRtpFrame(100, 0, byteArrayOf(1), ssrc = 1), 0)
+        queue.poll(0)
+        queue.offer(AudioRtpFrame(101, 480, byteArrayOf(1), ssrc = 1), 500_000_000)
+        queue.poll(500_000_000)
+        assertTrue(queue.jitterMs > 0)
+        queue.offer(AudioRtpFrame(0, 0, byteArrayOf(1), ssrc = 2), 510_000_000)
+        assertEquals(0.0, queue.jitterMs, 0.0)
+    }
 }

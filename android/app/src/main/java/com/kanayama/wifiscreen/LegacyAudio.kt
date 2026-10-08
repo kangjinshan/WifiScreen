@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 class LegacyAudio(private val audible: () -> Boolean, private val error: (String) -> Unit) {
     private val queue = AudioRtpQueue()
+    private val sampleClock = AudioSampleClock()
     @Volatile private var running = true
     @Volatile var volume = 0.7f
     val packets = AtomicLong()
@@ -22,6 +23,11 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
     val inputRetries = AtomicLong()
     val concealedSamples = AtomicLong()
     val timestampResets = AtomicLong()
+    val timestampFallbacks: Long get() = sampleClock.timestampFallbacks
+    @Volatile var playing = false
+        private set
+    @Volatile var playedFrames = 0L
+        private set
     val queueDepth: Int get() = queue.size
     val missingPackets: Long get() = queue.missingPackets
     val reorderedPackets: Long get() = queue.reorderedPackets
@@ -59,14 +65,15 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
         var codec: MediaCodec? = null
         var track: AudioTrack? = null
-        var outputRate = 44100
+        var outputRate = AudioSampleClock.SAMPLE_RATE
         var outputChannels = 2
-        val sampleClock = AudioSampleClock()
         var pending: AudioRtpFrame? = null
         var activeSsrc: Long? = null
         var firstOutputPts: Long? = null
         var nextSample = 0L
         var writtenFrames = 0L
+        var previousPlaybackHead = 0L
+        var trackPlayedFrames = 0L
         var prerollWritten = 0
         var prerollDeadlineNs = 0L
         var prerollOriginNs = 0L
@@ -81,14 +88,23 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
 
         fun clearTrackState() {
             trackPlaying = false; writtenFrames = 0; prerollWritten = 0
+            playing = false; bufferedMs = 0; previousPlaybackHead = 0; trackPlayedFrames = 0
             prerollDeadlineNs = 0; prerollOriginNs = 0
             firstOutputPts = null; nextSample = 0
         }
-        fun resetTrack() {
-            runCatching { track?.pause() }; runCatching { track?.flush() }
-            clearTrackState()
+        fun updatePlaybackState() {
+            track?.let { output ->
+                val head = output.playbackHeadPosition.toLong() and 0xffffffffL
+                val advanced = (head - previousPlaybackHead) and 0xffffffffL
+                playedFrames += advanced; trackPlayedFrames += advanced
+                previousPlaybackHead = head
+                playing = output.playState == AudioTrack.PLAYSTATE_PLAYING
+                bufferedMs = ((writtenFrames - trackPlayedFrames).coerceAtLeast(0) * 1000 / outputRate).toInt()
+                if (Build.VERSION.SDK_INT >= 24) underruns = savedUnderruns + output.underrunCount
+            }
         }
         fun closeTrack() {
+            runCatching { updatePlaybackState() }
             if (Build.VERSION.SDK_INT >= 24) savedUnderruns += runCatching { track?.underrunCount ?: 0 }.getOrDefault(0)
             runCatching { track?.pause() }; runCatching { track?.flush() }
             runCatching { track?.stop() }; runCatching { track?.release() }
@@ -159,15 +175,13 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
             if (!trackPlaying && prerollWritten >= preroll && System.nanoTime() >= prerollDeadlineNs) {
                 output.play(); trackPlaying = true
             }
-            val played = output.playbackHeadPosition.toLong() and 0xffffffffL
-            bufferedMs = ((writtenFrames - played).coerceAtLeast(0) * 1000 / outputRate).toInt()
-            if (Build.VERSION.SDK_INT >= 24) underruns = savedUnderruns + output.underrunCount
+            updatePlaybackState()
         }
 
         try {
             // Warm up while video is starting, so decoder construction cannot become
             // a permanent audio offset behind an already running video clock.
-            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2).apply {
+            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AudioSampleClock.SAMPLE_RATE, 2).apply {
                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectELD)
                 setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(0xf8.toByte(), 0xe8.toByte(), 0x50, 0)))
             }
@@ -194,8 +208,8 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                         input.put(frame.data)
                         if (prerollOriginNs == 0L) prerollOriginNs = frame.receivedNs
                         val samples = sampleClock.position(frame.sequence, frame.timestamp)
-                        // RTP clock preserves missing-packet time and avoids cumulative 480/44100 rounding drift.
-                        codec!!.queueInputBuffer(index, 0, frame.data.size, samples * 1_000_000L / 44100, 0)
+                        // The fixed-duration clock preserves gaps without trusting legacy RTP timestamp units.
+                        codec!!.queueInputBuffer(index, 0, frame.data.size, samples * 1_000_000L / AudioSampleClock.SAMPLE_RATE, 0)
                     } else {
                         pending = frame
                         inputRetries.incrementAndGet()
@@ -244,9 +258,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                     if (!trackPlaying && prerollWritten >= prerollBytes && System.nanoTime() >= prerollDeadlineNs) {
                         output.play(); trackPlaying = true
                     }
-                    if (Build.VERSION.SDK_INT >= 24) underruns = savedUnderruns + output.underrunCount
-                    val played = output.playbackHeadPosition.toLong() and 0xffffffffL
-                    bufferedMs = ((writtenFrames - played).coerceAtLeast(0) * 1000 / outputRate).toInt()
+                    updatePlaybackState()
                 }
                 if (frame == null) Thread.sleep(2)
             }

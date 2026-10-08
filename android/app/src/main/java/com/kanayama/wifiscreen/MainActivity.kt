@@ -462,7 +462,7 @@ class MainActivity : AppCompatActivity() {
             "连接状态" to if (snapshot.playing) "正在投屏" else if (receiver.isReady) "等待连接" else "正在恢复",
             "接收画面" to if (snapshot.width > 0) "${snapshot.width} × ${snapshot.height}" else "—",
             "实时速率" to if (snapshot.playing) rateText() else "—",
-            "声音" to when { receiver.muted -> "已静音"; snapshot.audioError.isNotEmpty() -> "音频异常"; snapshot.audioPcmBytes > 0 -> "正在播放"; snapshot.audioPackets > 0 -> "正在准备"; else -> "未接收音频" },
+            "声音" to when { receiver.muted -> "已静音"; snapshot.audioError.isNotEmpty() -> "音频异常"; snapshot.audioPlaying -> "播放已启动"; snapshot.audioPackets > 0 -> "正在准备"; else -> "未接收音频" },
             "局域网 IP" to (latestRecovery?.address?.ifEmpty { "未连接" } ?: "未连接")
         )
         facts.forEachIndexed { index, (label, value) ->
