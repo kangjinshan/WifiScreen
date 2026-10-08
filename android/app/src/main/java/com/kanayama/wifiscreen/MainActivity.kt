@@ -1,6 +1,7 @@
 package com.kanayama.wifiscreen
 
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -21,9 +22,11 @@ import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import java.util.Locale
 import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
@@ -34,12 +37,32 @@ class MainActivity : AppCompatActivity() {
     private lateinit var state: TextView
     private lateinit var details: TextView
     private lateinit var video: SurfaceView
+    private lateinit var videoFrame: FrameLayout
+    private lateinit var rateOverlay: TextView
     private lateinit var receiver: LegacyReceiver
     @Volatile private var surface: Surface? = null
     private val diagnostics = Executors.newSingleThreadExecutor()
     private var reportBusy = false
     private var resumed = false
     private var playing = false
+    private val preferences by lazy { getSharedPreferences("display", MODE_PRIVATE) }
+    private var showRates = false
+    private val rateMeter = StreamRateMeter()
+    private val refreshRates = object : Runnable {
+        override fun run() {
+            if (!resumed || !playing || !showRates) return
+            val counters = receiver.streamCounters()
+            val rates = counters?.let { rateMeter.sample(it, System.nanoTime()) }
+            if (counters == null) rateMeter.reset()
+            rateOverlay.text = if (rates == null) "-- FPS · -- KB/s" else {
+                val megabytes = rates.bytesPerSecond >= 1_000_000
+                String.format(Locale.US, "%.0f FPS · %.2f %s", rates.framesPerSecond,
+                    rates.bytesPerSecond / if (megabytes) 1_000_000 else 1_000,
+                    if (megabytes) "MB/s" else "KB/s")
+            }
+            rateOverlay.postDelayed(this, 1000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +72,7 @@ class MainActivity : AppCompatActivity() {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
+        showRates = preferences.getBoolean("show_realtime_rates", false)
         buildScreen()
         receiver = LegacyReceiver(this, { surface }, { message ->
             if (resumed) state.text = message
@@ -57,9 +81,11 @@ class MainActivity : AppCompatActivity() {
                 playing = true
                 fitVideo(width, height)
                 idle.visibility = View.GONE
+                updateRateOverlay()
             }
         }, { message ->
             playing = false
+            updateRateOverlay()
             idle.visibility = View.VISIBLE
             state.text = message
         })
@@ -68,6 +94,7 @@ class MainActivity : AppCompatActivity() {
                 if (playing) {
                     receiver.disconnect()
                     playing = false
+                    updateRateOverlay()
                     idle.visibility = View.VISIBLE
                     state.text = "投屏已结束，等待手机重新连接"
                 } else finish()
@@ -77,13 +104,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildScreen() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        videoFrame = FrameLayout(this)
         video = SurfaceView(this)
         video.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) { surface = holder.surface }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) { surface = holder.surface }
             override fun surfaceDestroyed(holder: SurfaceHolder) { surface = null }
         })
-        root.addView(video, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        videoFrame.addView(video, FrameLayout.LayoutParams(-1, -1))
+        rateOverlay = TextView(this).apply {
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.rgb(96, 255, 112))
+            setShadowLayer(dp(2).toFloat(), 0f, 0f, Color.BLACK)
+            setPadding(dp(4), dp(2), dp(4), dp(2))
+            setBackgroundColor(Color.argb(96, 0, 0, 0))
+            isFocusable = false
+            isClickable = false
+            visibility = View.GONE
+        }
+        videoFrame.addView(rateOverlay, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+            marginStart = dp(12); topMargin = dp(12)
+        })
+        root.addView(videoFrame, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(40), dp(28), dp(40), dp(28))
@@ -113,6 +156,29 @@ class MainActivity : AppCompatActivity() {
             runCatching { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) }
                 .onFailure { state.text = "系统没有开放 Wi-Fi 设置入口，请从投影仪设置进入" }
         }, margin(top = 12, height = 48))
+        buttons.addView(SwitchCompat(this).apply {
+            text = "显示实时速率"
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = shape(Color.rgb(27, 42, 61))
+            isFocusable = true
+            val tintStates = arrayOf(intArrayOf(android.R.attr.state_focused),
+                intArrayOf(android.R.attr.state_checked), intArrayOf())
+            thumbTintList = ColorStateList(tintStates, intArrayOf(ink, accent, Color.rgb(188, 199, 211)))
+            trackTintList = ColorStateList(tintStates,
+                intArrayOf(Color.argb(100, 16, 25, 39), Color.rgb(57, 110, 103), Color.rgb(84, 103, 122)))
+            isChecked = showRates
+            setOnFocusChangeListener { _, focus ->
+                background = shape(if (focus) accent else Color.rgb(27, 42, 61))
+                setTextColor(if (focus) ink else Color.WHITE)
+            }
+            setOnCheckedChangeListener { _, checked ->
+                showRates = checked
+                preferences.edit().putBoolean("show_realtime_rates", checked).apply()
+                updateRateOverlay()
+            }
+        }, margin(top = 12, height = 48))
         buttons.addView(button("退出应用") { finish() }, margin(top = 12, height = 48))
         content.addView(text(
             "1. 手机与投影连接同一 Wi-Fi。\n2. 手机下拉控制中心，打开「投屏」，选择 " + LegacyReceiver.displayName + "。\n3. 连接后自动全屏显示；按遥控器返回键结束本次投屏。", 14f), margin(top = 24))
@@ -126,7 +192,16 @@ class MainActivity : AppCompatActivity() {
     private fun fitVideo(width: Int, height: Int) {
         if (width <= 0 || height <= 0 || root.width == 0) return
         val scale = minOf(root.width.toFloat() / width, root.height.toFloat() / height)
-        video.layoutParams = FrameLayout.LayoutParams((width * scale).toInt(), (height * scale).toInt(), Gravity.CENTER)
+        videoFrame.layoutParams = FrameLayout.LayoutParams((width * scale).toInt(), (height * scale).toInt(), Gravity.CENTER)
+    }
+
+    private fun updateRateOverlay() {
+        val visible = resumed && playing && showRates
+        if (visible && rateOverlay.visibility == View.VISIBLE) return
+        rateOverlay.removeCallbacks(refreshRates)
+        rateMeter.reset()
+        rateOverlay.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible) refreshRates.run()
     }
 
     override fun onResume() {
@@ -171,6 +246,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         resumed = false
         playing = false
+        updateRateOverlay()
         receiver.stop()
         idle.visibility = View.VISIBLE
         super.onStop()

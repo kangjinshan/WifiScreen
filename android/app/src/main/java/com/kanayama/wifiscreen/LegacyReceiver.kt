@@ -26,6 +26,7 @@ import org.json.JSONObject
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.pow
 
 /** Independent legacy LAN receiver: discovery, HTTP/RTSP session, AVC and AAC-ELD. */
@@ -50,6 +51,7 @@ class LegacyReceiver(
     @Volatile private var running = false
     @Volatile private var generation = 0
     @Volatile private var active: Session? = null
+    private val sessionIds = AtomicLong()
     @Volatile private var lastReport = "尚未接收投屏"
     @Volatile private var lastError = ""
     @Volatile private var lastHandshake = ""
@@ -68,6 +70,8 @@ class LegacyReceiver(
     private val deviceReport by lazy { DeviceProfile.report(context) }
 
     private inner class Session(val peer: String, val videoSocket: Socket, val controlSocket: Socket?) {
+        val id = sessionIds.incrementAndGet()
+        val receivedBytes = AtomicLong()
         val started = SystemClock.elapsedRealtime()
         @Volatile var hasPicture = false
         @Volatile var closed = false
@@ -215,6 +219,7 @@ class LegacyReceiver(
                     DataInputStream(input).readFully(header, 4, header.size - 4)
                     val payload = ByteArray(LegacyAvc.payloadSize(header))
                     DataInputStream(input).readFully(payload)
+                    owner.receivedBytes.addAndGet((header.size + payload.size).toLong())
                     owner.decoder.offer(LegacyAvc.frame(header, payload), streamTime)
                     continue
                 }
@@ -361,11 +366,15 @@ class LegacyReceiver(
             packet.length = bytes.size
             try { datagram.receive(packet) } catch (_: SocketTimeoutException) { continue } catch (_: IOException) { break }
             val session = active ?: continue
-            if (packet.address.hostAddress != session.peer) continue
+            if (session.closed || packet.address.hostAddress != session.peer) continue
+            session.receivedBytes.addAndGet(packet.length.toLong())
             session.sound.offer(packet.data.copyOfRange(0, packet.length))
         }
     }
 
+    fun streamCounters(): StreamCounters? = active?.takeUnless { it.closed }?.let {
+        StreamCounters(it.id, it.decoder.presented.get(), it.receivedBytes.get())
+    }
     fun report(): String = active?.report() ?: lastReport
     fun diagnostics(): String = "固定诊断地址：http://" + address + ":" + CONTROL_PORT + "/diagnostics\n" +
         "应用在前台时可读取，退出应用后关闭。\n\n" + report() + "\n\n" + deviceReport

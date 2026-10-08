@@ -19,6 +19,7 @@ class LegacyVideo(
     @Volatile private var running = true
     val received = AtomicLong()
     val decoded = AtomicLong()
+    val presented = AtomicLong()
     val dropped = AtomicLong()
     val keyframes = AtomicLong()
     val queueDepth: Int get() = queue.size
@@ -152,6 +153,7 @@ class LegacyVideo(
                                 while (running && targetNs > System.nanoTime()) Thread.sleep(1)
                                 if (!running) break
                                 current.releaseOutputBuffer(index, true)
+                                presented.incrementAndGet()
                             }
                             decoded.incrementAndGet()
                             lastOutputAt = SystemClock.elapsedRealtime()
