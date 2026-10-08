@@ -105,6 +105,11 @@ class LegacyReceiver(
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
             "\n接收关键帧：" + decoder.keyframes.get() + "\n距上次视频输出：" + decoder.outputAgeMs + " ms" +
             "\n音频包：" + sound.packets.get() + "\nPCM 输出：" + sound.pcmBytes.get() + " bytes" +
+            "\n音频播放欠载：" + sound.underruns + "\n音频缓冲：" + sound.bufferedMs + " ms" +
+            "\n系统原有音频缓冲：" + sound.platformBufferMs + " ms" +
+            "\n音频 RTP 缺包 / 乱序：" + sound.missingPackets + " / " + sound.reorderedPackets +
+            "\n音频到达抖动估计：" + String.format(java.util.Locale.ROOT, "%.2f", sound.jitterMs) + " ms" +
+            "\n音频解码等待：" + sound.inputRetries.get() + "\n新增缓冲目标：" + PlaybackTiming.BUFFER_MS + " ms" +
             "\n最近错误：" + lastError.ifEmpty { "无" }
         fun close() {
             if (closed) return
@@ -252,9 +257,27 @@ class LegacyReceiver(
                             .put("videoKeyframes", current?.decoder?.keyframes?.get() ?: 0)
                             .put("videoOutputAgeMs", current?.decoder?.outputAgeMs ?: -1)
                             .put("videoDecoderState", current?.decoder?.decoderState ?: "等待投屏")
+                            .put("videoPresentationDrops", current?.decoder?.dropped?.get() ?: 0)
                             .put("audioPackets", current?.sound?.packets?.get() ?: 0)
                             .put("audioPcmBytes", current?.sound?.pcmBytes?.get() ?: 0)
                             .put("audioCodec", current?.sound?.codecName ?: "")
+                            .put("audioReady", current?.sound?.ready ?: false)
+                            .put("audioError", current?.sound?.errorMessage ?: "")
+                            .put("playbackBufferMs", PlaybackTiming.BUFFER_MS)
+                            .put("audioUnderruns", current?.sound?.underruns ?: 0)
+                            .put("audioBufferedMs", current?.sound?.bufferedMs ?: 0)
+                            .put("audioPlatformBufferMs", current?.sound?.platformBufferMs ?: 0)
+                            .put("audioBufferCapacityMs", current?.sound?.bufferCapacityMs ?: 0)
+                            .put("audioQueueDepth", current?.sound?.queueDepth ?: 0)
+                            .put("audioRtpMissingPackets", current?.sound?.missingPackets ?: 0)
+                            .put("audioReorderedPackets", current?.sound?.reorderedPackets ?: 0)
+                            .put("audioDuplicatePackets", current?.sound?.duplicatePackets ?: 0)
+                            .put("audioLatePackets", current?.sound?.latePackets ?: 0)
+                            .put("audioQueueOverflows", current?.sound?.overflowPackets ?: 0)
+                            .put("audioRtpJitterMs", current?.sound?.jitterMs ?: 0.0)
+                            .put("audioInputRetries", current?.sound?.inputRetries?.get() ?: 0)
+                            .put("audioConcealedSamples", current?.sound?.concealedSamples?.get() ?: 0)
+                            .put("audioTimestampResets", current?.sound?.timestampResets?.get() ?: 0)
                             .put("lastError", lastError).toString()
                         type = "application/json"
                     }

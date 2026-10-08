@@ -14,7 +14,7 @@ class LegacyVideo(
     private val firstFrame: (Int, Int) -> Unit,
     private val error: (String) -> Unit
 ) {
-    private data class Input(val frame: LegacyFrame, val streamTime: String)
+    private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long)
     private val queue = VideoInputQueue<Input>(32)
     @Volatile private var running = true
     val received = AtomicLong()
@@ -42,7 +42,7 @@ class LegacyVideo(
             if (LegacyAvc.isKeyframe(frame.data)) keyframes.incrementAndGet()
         }
         // Blocking the TCP reader applies bounded backpressure without losing reference frames.
-        queue.put(Input(frame, streamTime))
+        queue.put(Input(frame, streamTime, System.nanoTime()))
     }
 
     private fun decode() {
@@ -52,6 +52,7 @@ class LegacyVideo(
         var awaitingKeyframe = true
         var announced = false
         var pending: Input? = null
+        val presentationClock = VideoPresentationClock()
         val info = MediaCodec.BufferInfo()
         fun release() {
             decoderState = "正在重置解码器"
@@ -60,6 +61,7 @@ class LegacyVideo(
             codec = null
             configuredSurface = null
             awaitingKeyframe = true
+            presentationClock.reset()
             decoderState = "等待关键帧"
         }
         try {
@@ -81,10 +83,21 @@ class LegacyVideo(
                             }
                         } else {
                             val target = surface()
-                            if (target == null || !target.isValid) { release(); continue }
-                            if (codec != null && configuredSurface !== target) release()
+                            if (target == null || !target.isValid) {
+                                decoderState = "等待显示表面"
+                                pending = input
+                                Thread.sleep(5)
+                                continue
+                            }
+                            if (codec != null && configuredSurface !== target) {
+                                if (Build.VERSION.SDK_INT >= 23) {
+                                    try { codec!!.setOutputSurface(target); configuredSurface = target }
+                                    catch (_: Exception) { release() }
+                                } else release()
+                            }
                             if (awaitingKeyframe && !LegacyAvc.isKeyframe(frame.data)) continue
                             val parameters = config ?: continue
+                            presentationClock.observeInput(frame.timeUs, input.receivedNs)
                             if (codec == null) {
                                 decoderState = "正在启动解码器"
                                 val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
@@ -129,10 +142,20 @@ class LegacyVideo(
                     while (running) {
                         val index = current.dequeueOutputBuffer(info, 0)
                         if (index >= 0) {
-                            current.releaseOutputBuffer(index, true)
+                            val targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime())
+                            if (targetNs == null) {
+                                current.releaseOutputBuffer(index, false)
+                                dropped.incrementAndGet()
+                            } else {
+                                // Older TV codecs do not consistently honor the timestamped release overload.
+                                // Pace in our thread, then use the widely supported immediate render call.
+                                while (running && targetNs > System.nanoTime()) Thread.sleep(1)
+                                if (!running) break
+                                current.releaseOutputBuffer(index, true)
+                            }
                             decoded.incrementAndGet()
                             lastOutputAt = SystemClock.elapsedRealtime()
-                            if (!announced) { announced = true; firstFrame(width, height) }
+                            if (!announced && targetNs != null) { announced = true; firstFrame(width, height) }
                         } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             val output = current.outputFormat
                             width = if (output.containsKey("crop-right"))
