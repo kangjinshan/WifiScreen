@@ -4,13 +4,11 @@
 
 **安装在电视 / 投影仪上，手机直接使用系统投屏。** 无需手机配套 App，无需 Root，应用不设置投屏时长限制。
 
-**[下载已发布版 0.1.4](https://github.com/kangjinshan/WifiScreen/releases/latest)** · [查看更新](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
+**[下载最新版 APK](https://github.com/kangjinshan/WifiScreen/releases/latest)** · [查看更新](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
 ![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
 *上图是 0.2.1 的模拟器界面。连接时，请选择你电视首页显示的设备名称；真实设备默认名称为「WifiScreen 投影」，也可以自行修改。*
-
-> **下载版本说明：** GitHub 目前已发布的 APK 为 **0.1.4**。上图与下方的遥控器菜单、画面调整、设备改名说明适用于 **0.2.0 及更新版本**；这些功能在 0.1.4 中尚不可用。下载前请核对发布页的版本号。
 
 ## 先确认你的设备
 
@@ -52,8 +50,6 @@
 | 画面调整 / 连接信息 | 返回 | 回到投屏菜单 |
 | 想结束投屏 | 菜单 → 结束投屏 → 确认 | 断开手机，回到等待连接页 |
 | 等待连接页 | 返回 | 退出应用 |
-
-0.1.4 中，投屏时按遥控器返回会直接结束本次投屏。
 
 ## 常用设置
 

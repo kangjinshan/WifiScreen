@@ -16,7 +16,9 @@ import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.appcompat.content.res.AppCompatResources
 import androidx.appcompat.widget.AppCompatButton
+import androidx.core.graphics.drawable.DrawableCompat
 
 class CinemaUi(private val context: Context) {
     val ink = Color.rgb(16, 18, 20)
@@ -36,8 +38,13 @@ class CinemaUi(private val context: Context) {
     fun shape(fill: Int = panel, radius: Int = 12, border: Int = line, thickness: Int = 1) = GradientDrawable().apply {
         setColor(fill); cornerRadius = dp(radius).toFloat(); setStroke(dp(thickness), border)
     }
-    fun icon(kind: String, size: Int = 24, color: Int = white) = CinemaIcon(kind, color).apply {
-        setBounds(0, 0, dp(size), dp(size))
+    fun icon(kind: String, size: Int = 24, color: Int = white): Drawable {
+        val drawable = if (kind == "cast") {
+            requireNotNull(AppCompatResources.getDrawable(context, R.drawable.ic_cast)).mutate().also {
+                DrawableCompat.setTint(it, color)
+            }
+        } else CinemaIcon(kind, color)
+        return drawable.apply { setBounds(0, 0, dp(size), dp(size)) }
     }
     fun button(label: String, glyph: String? = null, action: () -> Unit): Button = CinemaButton(context).apply {
         id = View.generateViewId()
@@ -97,12 +104,6 @@ class CinemaIcon(private val kind: String, color: Int) : Drawable() {
             canvas.drawPath(p, paint)
         }
         when (kind) {
-            "cast" -> {
-                path(3f, 7f, 3f, 4f, 21f, 4f, 21f, 18f, 15f, 18f)
-                canvas.drawArc(RectF(-8f, 10f, 14f, 32f), 270f, 90f, false, paint)
-                canvas.drawArc(RectF(-4f, 14f, 10f, 28f), 270f, 90f, false, paint)
-                canvas.drawCircle(3f, 21f, .8f, paint)
-            }
             "settings" -> {
                 canvas.drawCircle(12f, 12f, 7f, paint); canvas.drawCircle(12f, 12f, 2.5f, paint)
                 repeat(8) { canvas.save(); canvas.rotate(it * 45f, 12f, 12f); line(12f, 2f, 12f, 5f); canvas.restore() }
