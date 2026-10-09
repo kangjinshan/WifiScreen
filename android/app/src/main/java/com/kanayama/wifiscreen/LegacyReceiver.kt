@@ -110,10 +110,12 @@ class LegacyReceiver(
             "\n时长：" + (SystemClock.elapsedRealtime() - started) / 1000 + " 秒" +
             "\n视频接收：" + decoder.received.get() + " 帧" +
             "\n视频输出：" + decoder.decoded.get() + " 帧" +
+            "\n视频已显示：" + decoder.presented.get() + " 帧" +
             "\n视频尺寸：" + decoder.width + " × " + decoder.height +
             "\n解码状态：" + decoder.decoderState +
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
             "\n视频正在追帧：" + decoder.catchingUp + "\n画面接收至显示：" + decoder.receiverLatencyMs + " ms" +
+            "\n待显示队列：" + decoder.presentationQueueDepth + "\n最近画面显示等待：" + decoder.presentationHoldMs + " ms" +
             "\n视频跟随音频：" + decoder.usingAudioClock + "\n音画时间差：" + decoder.audioSkewMs + " ms" +
             "\n接收关键帧：" + decoder.keyframes.get() + "\n距上次视频输出：" + decoder.outputAgeMs + " ms" +
             "\n音频包：" + sound.packets.get() + "\nPCM 写入：" + sound.pcmBytes.get() + " bytes" +
@@ -271,6 +273,12 @@ class LegacyReceiver(
                             .put("muted", muted)
                             .put("videoReceived", current?.decoder?.received?.get() ?: 0)
                             .put("videoDecoded", current?.decoder?.decoded?.get() ?: 0)
+                            .put("videoPresented", current?.decoder?.presented?.get() ?: 0)
+                            .put("videoPresentedAgeMs", current?.decoder?.presentedAgeMs ?: -1)
+                            .put("videoPresentationQueueDepth", current?.decoder?.presentationQueueDepth ?: 0)
+                            .put("videoPresentationHoldMs", current?.decoder?.presentationHoldMs ?: 0)
+                            .put("videoRenderCallMs", current?.decoder?.renderCallMs ?: 0)
+                            .put("videoForcedPresentations", current?.decoder?.forcedPresentations?.get() ?: 0)
                             .put("videoCodec", current?.decoder?.codecName ?: "")
                             .put("videoWidth", current?.decoder?.width ?: 0)
                             .put("videoHeight", current?.decoder?.height ?: 0)

@@ -24,6 +24,15 @@ class LegacyVideo(
     val presented = AtomicLong()
     val dropped = AtomicLong()
     val audioSyncDrops = AtomicLong()
+    val forcedPresentations = AtomicLong()
+    @Volatile var presentationQueueDepth = 0
+        private set
+    @Volatile var presentationHoldMs = 0L
+        private set
+    @Volatile var renderCallMs = 0L
+        private set
+    @Volatile private var lastPresentedAt = 0L
+    val presentedAgeMs: Long get() = if (lastPresentedAt == 0L) -1 else SystemClock.elapsedRealtime() - lastPresentedAt
     val audioClockRejections: Long get() = playbackClock?.rejectedOffsets ?: 0
     val audioClockOffsetMs: Long get() = playbackClock?.lastOffsetMs ?: 0
     @Volatile var usingAudioClock = false
@@ -67,11 +76,18 @@ class LegacyVideo(
         var announced = false
         var pending: Input? = null
         val inputArrivals = VideoFrameTracker()
+        val outputs = VideoPresentationQueue()
         var lastCodecActivityNs = 0L
+        var inputStallSinceNs = 0L
         val presentationClock = VideoPresentationClock()
         val info = MediaCodec.BufferInfo()
         fun release() {
             decoderState = "正在重置解码器"
+            for (frame in outputs.clear()) {
+                runCatching { codec?.releaseOutputBuffer(frame.index, false) }
+                dropped.incrementAndGet()
+            }
+            presentationQueueDepth = 0; inputStallSinceNs = 0
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             codec = null
@@ -87,13 +103,81 @@ class LegacyVideo(
         // OEM codecs may combine input units or omit output callbacks. The
         // input-minus-output total is not a live queue and must not gate sync.
         fun hasBacklog(): Boolean = queue.size >= 2
+
+        fun refreshOutput(frame: VideoOutputFrame, nowNs: Long, catchUp: Boolean) {
+            if (frame.usesAudioClock && !frame.syncDrop) {
+                val audioTarget = playbackClock?.videoTargetNs(frame.ptsUs, nowNs)
+                if (audioTarget == null) {
+                    frame.usesAudioClock = false
+                    frame.targetNs = frame.fallbackNs
+                } else {
+                    audioSkewMs = (audioTarget - nowNs) / 1_000_000L
+                    frame.syncDrop = audioSkewMs < -40 || playbackClock?.videoWasSkipped(frame.ptsUs, nowNs) == true
+                    frame.targetNs = if (frame.syncDrop) null else maxOf(audioTarget, nowNs)
+                }
+            }
+            if (catchUp && !frame.syncDrop) {
+                val waitingForAudio = frame.usesAudioClock && frame.targetNs?.let { it > nowNs } == true
+                frame.usesAudioClock = false
+                if (waitingForAudio) {
+                    frame.earlyForThroughput = true
+                    frame.targetNs = nowNs
+                } else frame.targetNs = presentationClock.presentationTime(frame.ptsUs, nowNs, catchingUp = true)
+            }
+            catchingUp = catchUp || frame.syncDrop
+        }
+
+        fun releaseOutput(frame: VideoOutputFrame, nowNs: Long) {
+            val show = frame.targetNs != null
+            val early = frame.earlyForThroughput || frame.targetNs?.let { it > nowNs } == true
+            val callStartedNs = System.nanoTime()
+            codec!!.releaseOutputBuffer(frame.index, show)
+            val releasedAtNs = System.nanoTime()
+            renderCallMs = (releasedAtNs - callStartedNs) / 1_000_000L
+            usingAudioClock = frame.usesAudioClock && !early
+            if (!usingAudioClock) audioSkewMs = 0
+            presentationHoldMs = (releasedAtNs - frame.decodedNs).coerceAtLeast(0) / 1_000_000L
+            if (show) {
+                if (early) forcedPresentations.incrementAndGet()
+                presented.incrementAndGet()
+                lastPresentedAt = SystemClock.elapsedRealtime()
+                receiverLatencyMs = frame.receivedNs?.let { (releasedAtNs - it) / 1_000_000L } ?: -1
+                if (!announced) { announced = true; firstFrame(frame.width, frame.height) }
+            } else {
+                dropped.incrementAndGet()
+                if (frame.syncDrop) audioSyncDrops.incrementAndGet()
+            }
+        }
+
+        fun drainPresentations(forceProgress: Boolean = false): Boolean {
+            var progress = false
+            while (running) {
+                val first = outputs.first() ?: break
+                val nowNs = System.nanoTime()
+                refreshOutput(first, nowNs, hasBacklog())
+                val ready = outputs.poll(nowNs, forceProgress) ?: break
+                presentationQueueDepth = outputs.size
+                releaseOutput(ready, nowNs)
+                progress = true
+                if (forceProgress) break
+            }
+            return progress
+        }
         try {
             while (running) {
                 var progressed = false
+                if (codec != null) {
+                    try { progressed = drainPresentations() }
+                    catch (failure: Exception) {
+                        release()
+                        error("视频显示：" + (failure.message ?: failure.javaClass.simpleName))
+                    }
+                }
                 // Poll promptly after actual codec activity; idle input metadata
                 // must not keep this thread spinning forever.
-                val input = pending ?: queue.poll(if (codec == null ||
-                    System.nanoTime() - lastCodecActivityNs >= 10_000_000L) 5 else 0)
+                val waitMs = if (outputs.size > 0) outputs.waitMs(System.nanoTime()) else
+                    if (codec == null || System.nanoTime() - lastCodecActivityNs >= 10_000_000L) 5 else 0
+                val input = pending ?: queue.poll(waitMs)
                 pending = null
                 if (input != null) {
                     val frame = input.frame
@@ -154,6 +238,7 @@ class LegacyVideo(
                                 playbackClock?.observeVideo(frame.timeUs, input.receivedNs)
                                 inputArrivals.record(frame.timeUs, input.receivedNs)
                                 lastCodecActivityNs = System.nanoTime()
+                                inputStallSinceNs = 0
                                 progressed = true
                                 awaitingKeyframe = false
                             } else {
@@ -162,6 +247,7 @@ class LegacyVideo(
                                 // output below, then retry the same input instead of resetting
                                 // the decoder and discarding pictures until the next IDR.
                                 pending = input
+                                if (inputStallSinceNs == 0L) inputStallSinceNs = System.nanoTime()
                             }
                         }
                     } catch (failure: Exception) {
@@ -179,57 +265,26 @@ class LegacyVideo(
                             val receivedNs = inputArrivals.take(info.presentationTimeUs)
                             playbackClock?.observeVideoOutput(info.presentationTimeUs)
                             val nowNs = System.nanoTime()
-                            var audioTarget = if (receivedNs != null && (usingAudioClock || !hasBacklog()))
+                            // Keep catch-up state until the real input queue is
+                            // drained; precomputing normal pacing here would
+                            // reset its preview throttle on every queued frame.
+                            val fallback = if (hasBacklog()) null else
+                                presentationClock.presentationTime(info.presentationTimeUs, nowNs)
+                            val audioTarget = if (receivedNs != null)
                                 playbackClock?.videoTargetNs(info.presentationTimeUs, nowNs) else null
-                            usingAudioClock = audioTarget != null
-                            audioSkewMs = audioTarget?.let { (it - nowNs) / 1_000_000L } ?: 0
-                            catchingUp = if (usingAudioClock) audioSkewMs < -40 else hasBacklog()
-                            var targetNs = if (audioTarget != null) {
-                                if (audioSkewMs < -40 || playbackClock?.videoWasSkipped(info.presentationTimeUs, nowNs) == true) {
-                                    audioSyncDrops.incrementAndGet(); null
-                                } else maxOf(audioTarget, nowNs)
-                            } else presentationClock.presentationTime(info.presentationTimeUs, nowNs, catchingUp)
-                            if (targetNs != null) {
-                                while (running && targetNs!! > System.nanoTime()) {
-                                    if (System.nanoTime() - nowNs >= 200_000_000L) {
-                                        usingAudioClock = false; targetNs = System.nanoTime(); break
-                                    }
-                                    if (usingAudioClock) {
-                                        val clockNow = System.nanoTime()
-                                        audioTarget = playbackClock?.videoTargetNs(info.presentationTimeUs, clockNow)
-                                        if (audioTarget == null) {
-                                            usingAudioClock = false
-                                            targetNs = presentationClock.presentationTime(info.presentationTimeUs, clockNow, hasBacklog())
-                                            if (targetNs == null) break
-                                        } else {
-                                            audioSkewMs = (audioTarget - clockNow) / 1_000_000L
-                                            if (audioSkewMs < -40 || playbackClock?.videoWasSkipped(info.presentationTimeUs, clockNow) == true) {
-                                                audioSyncDrops.incrementAndGet(); targetNs = null; break
-                                            }
-                                            targetNs = maxOf(audioTarget, clockNow)
-                                        }
-                                    } else if (hasBacklog()) {
-                                        catchingUp = true
-                                        targetNs = presentationClock.presentationTime(info.presentationTimeUs, System.nanoTime(), true)
-                                        break
-                                    }
-                                    Thread.sleep(1)
-                                }
-                            }
-                            if (!running) break
-                            if (targetNs == null) {
-                                current.releaseOutputBuffer(index, false)
-                                dropped.incrementAndGet()
-                            } else {
-                                // Older TV codecs do not consistently honor the timestamped release overload.
-                                // Use immediate rendering after the bounded pacing above.
-                                current.releaseOutputBuffer(index, true)
-                                receiverLatencyMs = receivedNs?.let { (System.nanoTime() - it) / 1_000_000L } ?: -1
-                                presented.incrementAndGet()
-                            }
+                            val frame = VideoOutputFrame(index, info.presentationTimeUs, receivedNs, nowNs,
+                                width, height, fallback, audioTarget ?: fallback, audioTarget != null)
                             decoded.incrementAndGet()
                             lastOutputAt = SystemClock.elapsedRealtime()
-                            if (!announced && targetNs != null) { announced = true; firstFrame(width, height) }
+                            // Never sleep with a codec output in hand. Keep feeding
+                            // inputs while its deadline is pending; free older
+                            // outputs early when the hardware runs out of buffers.
+                            outputs.offer(frame)?.let { displaced ->
+                                refreshOutput(displaced, nowNs, hasBacklog())
+                                releaseOutput(displaced, nowNs)
+                            }
+                            presentationQueueDepth = outputs.size
+                            drainPresentations()
                         } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             progressed = true
                             val output = current.outputFormat
@@ -239,6 +294,11 @@ class LegacyVideo(
                                 output.getInteger("crop-bottom") - (if (output.containsKey("crop-top")) output.getInteger("crop-top") else 0) + 1 else output.getInteger(MediaFormat.KEY_HEIGHT)
                             if (announced) firstFrame(width, height)
                         } else break
+                    }
+                    if (drainPresentations()) progressed = true
+                    if (pending != null && inputStallSinceNs != 0L &&
+                        System.nanoTime() - inputStallSinceNs >= PlaybackTiming.BUFFER_NS) {
+                        if (drainPresentations(forceProgress = true)) progressed = true
                     }
                 } catch (failure: Exception) {
                     release()

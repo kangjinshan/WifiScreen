@@ -57,6 +57,7 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 | `AudioContinuity.kt` / `PcmConcealer.kt` | 有限波形补偿、迟到 PCM 去重和缺口接续 |
 | `AvPlaybackClock.kt` | AudioTrack 播放进度与源媒体时间映射、音画同步跳时 |
 | `VideoFrameTracker.kt` | 有界的视频输入时间记录，兼容一个画面由多个输入单元组成 |
+| `VideoPresentationQueue.kt` | 有界的待显示输出，允许解码与显示等待交错推进 |
 | `VideoViewport.kt` / `ReceiverName.kt` | 画面几何、名称校验与协议转义 |
 
 上述文件位于 `android/app/src/main/java/com/kanayama/wifiscreen/`。`NativeReceiver` / `WfdSession` 为早期 Miracast 实验代码，当前主界面使用 `LegacyReceiver`。
@@ -99,6 +100,10 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 0.2.5 也不再用累计输入数减输出数判断视频积压。部分编码器会拆分输入、部分硬件解码器会合并或省略输出，累计差值不代表待显示画面。追帧只参考实际应用队列；时间记录最多保留 64 项，同一时间戳的多个输入单元在画面输出时一起移除。时间戳可靠性按解码输出检查，避免重复的输入分片关闭音画同步。
 
 0.2.6 对音画偏差做双向有效性检查。超过 ±200ms 时，音频时钟不再用于该画面的同步决策，回退到已有的视频节奏和积压追帧；防止视频时钟暂停或偏移后产生持续的大负差，导致所有新输出都被丢弃。范围内的正常迟到帧仍参与同步。`videoAudioClockRejections` 统计异常偏差回退次数，`videoAudioClockOffsetMs` 保留最近一次计算的原始差值，便于区分时钟异常与解码停滞。
+
+0.2.7 取消了解码输出后的阻塞式同步等待。所有 MediaCodec 操作仍由同一线程拥有，但未来才显示的输出放入最多 4 项的队列，主循环继续喂入输入、排空解码输出并检查显示期限。队列满、输入缓冲持续不可用或持有超过 200ms 时释放较老输出；真实输入积压仍触发追帧。若只是等待音频导致缓冲压力，会提前显示以保障吞吐量，可能暂时降低同步精度。音频队列耗尽时立即恢复独立视频节奏，不等待陈旧时钟超时。不会清除参考数据、增加无界画面队列或恢复预测补音。
+
+新增 `videoPresented`、`videoPresentedAgeMs`、`videoPresentationQueueDepth`、`videoPresentationHoldMs`、`videoRenderCallMs`、`videoForcedPresentations`，分别观察显示提交、显示进度、待显示输出、持有时间、原生提交耗时和提前显示次数。`videoDecoded` 现在在取到解码输出时增加，待显示帧单独计数；实时 FPS 继续使用实际显示提交数，不改变统计口径。缓冲提前释放时 `videoUsingAudioClock` 为 false，不代表解码停止。
 
 ## 诊断与实时速率
 

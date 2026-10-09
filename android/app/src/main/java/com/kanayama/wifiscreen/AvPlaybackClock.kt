@@ -96,6 +96,9 @@ class AvPlaybackClock {
         val videoOrigin = videoOriginNs ?: return null
         val audioOrigin = audioOriginNs ?: return null
         val sample = audioMediaSample(nowNs) ?: return null
+        // An exhausted audio queue has no future playback deadline. Let live
+        // video continue instead of waiting for the stale-clock timeout.
+        if (head + (nowNs - headAtNs).coerceAtLeast(0) * rate / 1_000_000_000L >= written) return null
         val audioNs = maxOf(reportedAudioNs, audioOrigin + sampleTimeNs(sample))
         reportedAudioNs = audioNs
         val skew = videoOrigin + ptsUs * 1000 - audioNs

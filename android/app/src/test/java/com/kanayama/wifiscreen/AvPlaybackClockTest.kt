@@ -61,6 +61,17 @@ class AvPlaybackClockTest {
         assertEquals(480L, clock.audioMediaSample(150_000_000))
         assertNull(clock.audioMediaSample(201_000_000))
     }
+    @Test fun videoContinuesAsSoonAsAvailableAudioRunsOut() {
+        val clock = AvPlaybackClock()
+        clock.resetAudio(48000); clock.observeAudio(0, 0); clock.observeVideo(0, 0)
+        clock.appendAudio(0, 480); clock.updateAudio(0, 100_000_000, true)
+        assertNotNull(clock.videoTargetNs(5000, 105_000_000))
+        assertNull(clock.videoTargetNs(33333, 110_000_000))
+        clock.updateAudio(480, 120_000_000, true)
+        assertNull(clock.videoTargetNs(66666, 120_000_000))
+        clock.appendAudio(480, 960, 121_000_000)
+        assertNotNull(clock.videoTargetNs(33333, 121_000_000))
+    }
     @Test fun resumingAnEmptyTrackDoesNotPretendNewAudioAlreadyPlayed() {
         val clock = AvPlaybackClock()
         clock.resetAudio(48000); clock.observeAudio(0, 0)
