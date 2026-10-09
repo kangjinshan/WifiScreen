@@ -8,12 +8,14 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.Build
 import android.util.Log
+import android.util.AtomicFile
 import android.view.Surface
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
+import java.io.File
 import java.io.PushbackInputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -59,6 +61,10 @@ class LegacyReceiver(
     @Volatile private var lastReport = "尚未接收投屏"
     @Volatile private var lastError = ""
     @Volatile private var lastHandshake = ""
+    private val repairReportFile = AtomicFile(File(context.filesDir, "last-video-repair.txt"))
+    @Volatile private var lastRepairReport = runCatching {
+        repairReportFile.openRead().bufferedReader().use { it.readText().take(65_536) }
+    }.getOrDefault("")
     @Volatile var address = ""
         private set
     private val identity = context.getSharedPreferences("receiver", Context.MODE_PRIVATE)
@@ -128,7 +134,10 @@ class LegacyReceiver(
             "\n音频 RTP 缺包 / 乱序：" + sound.missingPackets + " / " + sound.reorderedPackets +
             "\n音频到达抖动估计：" + String.format(java.util.Locale.ROOT, "%.2f", sound.jitterMs) + " ms" +
             "\n音频解码等待：" + sound.inputRetries.get() + "\n新增缓冲目标：" + PlaybackTiming.BUFFER_MS + " ms" +
-            "\n最近错误：" + lastError.ifEmpty { "无" }
+            "\n最近错误：" + lastError.ifEmpty { "无" } +
+            "\n\n视频诊断（源颜色字段为 H.264 值，输出颜色字段为 Android 值；null 表示未知）：\n" +
+            decoder.diagnosticSnapshot().toJson().toString(2) +
+            "\n画面修复：\n" + decoder.repairStatus().toJson().toString(2)
         fun close() {
             if (closed) return
             closed = true
@@ -280,6 +289,9 @@ class LegacyReceiver(
                             .put("videoRenderCallMs", current?.decoder?.renderCallMs ?: 0)
                             .put("videoForcedPresentations", current?.decoder?.forcedPresentations?.get() ?: 0)
                             .put("videoCodec", current?.decoder?.codecName ?: "")
+                            .put("videoDiagnostics", current?.decoder?.diagnosticSnapshot()?.toJson() ?: JSONObject.NULL)
+                            .put("videoRepair", current?.decoder?.repairStatus()?.toJson() ?: JSONObject.NULL)
+                            .put("videoRepairReportAvailable", lastRepairReport.isNotEmpty())
                             .put("videoWidth", current?.decoder?.width ?: 0)
                             .put("videoHeight", current?.decoder?.height ?: 0)
                             .put("videoQueueDepth", current?.decoder?.queueDepth ?: 0)
@@ -447,7 +459,27 @@ class LegacyReceiver(
     }
     fun report(): String = active?.report() ?: lastReport
     fun diagnostics(): String = "固定诊断地址：http://" + address + ":" + CONTROL_PORT + "/diagnostics\n" +
-        "应用在前台时可读取，退出应用后关闭。\n\n" + report() + "\n\n" + deviceReport
+        "应用在前台时可读取，退出应用后关闭。\n\n" + report() + "\n\n" + deviceReport +
+        if (lastRepairReport.isEmpty()) "" else "\n\n最近一次修复前诊断（保留至下次修复）：\n" + lastRepairReport
+    fun pictureRepairStatus(): VideoRepairStatus? = active?.takeUnless { it.closed }?.decoder?.repairStatus()
+    val pictureRepairOwnsRecovery: Boolean get() = active?.takeUnless { it.closed }?.decoder?.repairOwnsRecovery == true
+    /** Disk I/O belongs to the activity's background diagnostics executor, never to the codec/UI thread. */
+    fun repairPicture(expectedSessionId: Long): String {
+        val session = active?.takeUnless { it.closed || !it.hasPicture || it.id != expectedSessionId }
+            ?: return "投屏已变化，请重新打开修复画面。"
+        return session.decoder.requestRepair {
+            val report = "保存时间（Unix ms）：${System.currentTimeMillis()}\nWifiScreen ${BuildConfig.VERSION_NAME}\n" + session.report()
+            val stream = repairReportFile.startWrite()
+            try {
+                stream.write(report.toByteArray(Charsets.UTF_8))
+                repairReportFile.finishWrite(stream)
+                lastRepairReport = report
+            } catch (failure: Exception) {
+                repairReportFile.failWrite(stream)
+                throw failure
+            }
+        }
+    }
     fun disconnect() { active?.close() }
     @Synchronized fun stop() {
         running = false

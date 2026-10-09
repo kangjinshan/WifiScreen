@@ -99,7 +99,10 @@ class ReceiverRecovery(
         }
         attempts = 0; startingAt = 0
         val snapshot = receiver.snapshot()
-        if (stalled.check(now, snapshot.sessionId, snapshot.received, snapshot.decoded,
+        // A user-requested picture repair has its own deadline and reconnect guidance.
+        // Do not disconnect its still-running audio/control session through the stall watchdog.
+        if (receiver.pictureRepairOwnsRecovery) stalled.reset()
+        else if (stalled.check(now, snapshot.sessionId, snapshot.received, snapshot.decoded,
                 snapshot.queueDepth, snapshot.sessionAgeMs, snapshot.playing)) {
             receiver.disconnect(); interrupted(); recovering = true
             announce(RecoveryState(address, "画面接收异常", "接收服务已就绪，请在手机重新选择投屏设备", true, true))

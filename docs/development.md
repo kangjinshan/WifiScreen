@@ -58,6 +58,8 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 | `AvPlaybackClock.kt` | AudioTrack 播放进度与源媒体时间映射、音画同步跳时 |
 | `VideoFrameTracker.kt` | 有界的视频输入时间记录，兼容一个画面由多个输入单元组成 |
 | `VideoPresentationQueue.kt` | 有界的待显示输出，允许解码与显示等待交错推进 |
+| `AvcParameters.kt` / `VideoRepair.kt` | 源颜色参数解析、完整 IDR 收集和用户触发的视频修复状态机 |
+| `VideoDiagnostics.kt` / `VideoDiagnosticsJson.kt` | 有界视频元数据历史、颜色参数与修复诊断输出 |
 | `VideoViewport.kt` / `ReceiverName.kt` | 画面几何、名称校验与协议转义 |
 
 上述文件位于 `android/app/src/main/java/com/kanayama/wifiscreen/`。`NativeReceiver` / `WfdSession` 为早期 Miracast 实验代码，当前主界面使用 `LegacyReceiver`。
@@ -112,6 +114,20 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 Android 8.0 及以上请求 AudioTrack 低延迟性能模式，构造失败时使用普通模式；系统可忽略请求，使用 `audioPerformanceMode` 观察实际结果。保留平台缓冲探测、额外 20ms 音频缓冲和连续 PCM 原样播放。新增 `audioClockStable`、`audioClockSwitches`、`audioClockCorrectionMs` 用于区分时钟源、切换和校正状态。提前显示会限制同步精度，不能用较低接收端延迟推断音画完全同步。
 
 ## 诊断与实时速率
+
+### 0.2.9 颜色诊断与画面修复
+
+`/status` 新增 `videoDiagnostics`、`videoRepair` 和 `videoRepairReportAvailable`。`videoDiagnostics` 包含解码器存活时间、最近关键帧/已解析 IDR 起始片距今时间、创建/释放次数、最近释放原因、配置版本和 SHA-256、源 SPS/VUI 参数、实际输出格式、最新输入/输出 PTS，以及最多 32 条事件。源颜色原色、传递函数、矩阵使用 H.264 的数值；输出色彩空间、传递函数、范围和像素格式使用 Android MediaFormat 的数值，不能直接比较两个枚举是否相等。`null` 表示未提供或无法解析；H.264 中的 2 仍表示源显式给出的未指定值。解析失败不改写码流、不强制颜色转换，也不触发自动重启。
+
+「修复画面」通过后台诊断线程原子保存 `last-video-repair.txt`，再通知解码线程等待自然 IDR。报告仅保留最新一次修复前的元数据，不含画面或音频；重新连接和应用重启后仍附加在 `/diagnostics` 中。重复点击/冷却拒绝不会覆盖上次报告，保存失败不会启动修复，旧会话的排队请求不能修复新会话。
+
+等待预算 2 秒，期间旧解码器继续播放。只接受当前 SPS/PPS 对应、普通逐行 AVC、无 FMO/独立色彩平面、从 first_mb_in_slice=0 开始且片序递增的 IDR。用下一个可解析图像的首片确认 TCP 顺序上的完整边界，不靠分片 PTS 相等推测完整性。最多保留 32 片、合计 4 MiB 的加密输入和解密数据；越界、参数变化、无法解析、未知 PPS 或片序不合法时清空候选并继续等。此检查不取代解码器对熵编码内容的校验。辅助图像 NAL 类型 19 保留原协议解密处理，但不作为普通 AVC 的安全重建边界。
+
+完整 IDR 的 Annex-B 分片合并成一次 codec 输入，随后按顺序喂入原有的下一单元；不会重复喂旧 IDR 后跳过中间参考数据。所有 codec 操作仍属于原解码线程，释放待显示输出一次，释放旧解码器后以最新参数重新配置，重置视频时间记录与同步基准。音频和 TCP 会话不重建。初始化先取得新实例所有权，再 configure/start，保证失败时能够释放资源。
+
+重建后最多等待 3 秒显示输出；`PRESENTED` 表示已向显示表面提交画面，不证明颜色恢复。`TIMED_OUT` 表示等待阶段未拿到可用 IDR，旧解码器保持；`FAILED` 表示重建/验证失败，停止该次重试并提示手机重连，保留音频和连接。修复状态拥有恢复处理时，旧停滞检测不会另行断开会话。再次手动修复至少间隔 30 秒。系统原生 codec 调用若阻塞，应用无法保证在墙钟预算内抢占该调用。
+
+当前没有实现未经验证的主动关键帧请求，也不依据红色像素比例或会话年龄自动修复。发送端已编码的偏色、OEM 视频平面异常、缺失关键帧或不支持的分片方式仍可能需要手机重新连接。目标投影的实际颜色恢复效果需要实机验收。
 
 应用在前台时提供固定只读地址：
 

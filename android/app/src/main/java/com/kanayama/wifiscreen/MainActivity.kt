@@ -63,6 +63,9 @@ class MainActivity : AppCompatActivity() {
     private val preferences by lazy { getSharedPreferences("display", MODE_PRIVATE) }
     private val diagnostics = Executors.newSingleThreadExecutor()
     private var reportBusy = false
+    private var repairBusy = false
+    private var repairMessage: TextView? = null
+    private var repairMessageOverride: String? = null
     private val rateMeter = StreamRateMeter()
     private val refreshRates = object : Runnable {
         override fun run() {
@@ -72,6 +75,8 @@ class MainActivity : AppCompatActivity() {
             if (counters == null) rateMeter.reset()
             rateOverlay.text = rateText()
             rateOverlay.visibility = if (playing && showRates) View.VISIBLE else View.GONE
+            if (overlayKind == "repair" && !repairBusy) repairMessage?.text =
+                repairMessageOverride ?: receiver.pictureRepairStatus()?.message ?: "投屏已结束"
             root.postDelayed(this, 1000)
         }
     }
@@ -235,6 +240,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeOverlay(restoreFocus: Boolean = true) {
+        repairMessage = null
         overlay?.let { root.removeView(it) }
         overlay = null; overlayKind = ""
         idle.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
@@ -265,15 +271,47 @@ class MainActivity : AppCompatActivity() {
             receiver.mute(!receiver.muted); showPlayerMenu(0)
         }
         val adjust = ui.button("画面调整", "picture") { showPicture() }
+        val repair = ui.button("修复画面", "picture") { repairPicture() }
         val info = ui.button("连接信息", "info") { showDiagnostics { showPlayerMenu() } }
         val end = ui.button("结束投屏", "stop") { confirmEnd() }
-        listOf(mute, adjust, info, end).forEachIndexed { index, button ->
+        listOf(mute, adjust, repair, info, end).forEachIndexed { index, button ->
             row.addView(button, LinearLayout.LayoutParams(0, ui.dp(58), 1f).apply { if (index > 0) leftMargin = ui.dp(10) })
         }
         sheet.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(10) })
         present("menu", sheet, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
             leftMargin = ui.dp(40); rightMargin = ui.dp(40); bottomMargin = ui.dp(26)
-        }, listOf(mute, adjust, info, end)[focusIndex])
+        }, listOf(mute, adjust, repair, info, end)[focusIndex])
+    }
+
+    private fun repairPicture() {
+        if (!playing) return
+        val sheet = ui.column().apply { setPadding(ui.dp(24), ui.dp(20), ui.dp(24), ui.dp(20)); background = ui.shape() }
+        sheet.addView(ui.text("修复画面", 22f, ui.white, true))
+        val message = ui.text("正在保存诊断…", 16f, ui.muted)
+        sheet.addView(message, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(12) })
+        val back = ui.button("返回投屏", "back") { closeOverlay() }
+        sheet.addView(back, LinearLayout.LayoutParams(-1, ui.dp(50)).apply { topMargin = ui.dp(18) })
+        present("repair", sheet, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+            leftMargin = ui.dp(40); rightMargin = ui.dp(40); bottomMargin = ui.dp(26)
+        }, back) { showPlayerMenu(2) }
+        repairMessage = message
+        repairMessageOverride = null
+        if (repairBusy) return
+        repairBusy = true
+        val sessionId = receiver.snapshot().sessionId
+        diagnostics.execute {
+            val previousAttempts = receiver.pictureRepairStatus()?.attempts
+            val result = runCatching { receiver.repairPicture(sessionId) }.getOrElse { "未能开始修复，请稍后重试。" }
+            val accepted = receiver.pictureRepairStatus()?.attempts != previousAttempts
+            runOnUiThread {
+                repairBusy = false
+                if (!resumed || isFinishing || isDestroyed) return@runOnUiThread
+                if (receiver.snapshot().sessionId != sessionId) return@runOnUiThread
+                // Save/cooldown errors must remain visible instead of being overwritten by an old state.
+                repairMessageOverride = if (accepted || receiver.pictureRepairStatus()?.active == true) null else result
+                if (overlayKind == "repair") repairMessage?.text = result
+            }
+        }
     }
 
     private fun confirmEnd() {

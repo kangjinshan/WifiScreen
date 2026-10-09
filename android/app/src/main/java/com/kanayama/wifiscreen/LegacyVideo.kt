@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicLong
 
 /** All codec operations, including release, are owned by the decoder thread. */
@@ -16,7 +17,7 @@ class LegacyVideo(
     private val playbackClock: AvPlaybackClock? = null
 ) {
     private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long,
-        var accessUnit: ByteArray? = null)
+        val receivedMs: Long, var accessUnit: ByteArray? = null, var repairChecked: Boolean = false)
     private val queue = VideoInputQueue<Input>(4)
     @Volatile private var running = true
     val received = AtomicLong()
@@ -56,25 +57,51 @@ class LegacyVideo(
         private set
     @Volatile var codecName = ""
         private set
+    private val health = VideoDiagnostics(SystemClock.elapsedRealtime())
+    private val repair = VideoRepair<Input>()
+    fun diagnosticSnapshot(): VideoDiagnosticSnapshot = health.snapshot(SystemClock.elapsedRealtime())
+    fun repairStatus(): VideoRepairStatus = repair.snapshot()
+    val repairOwnsRecovery: Boolean get() = repairStatus().let { it.active || it.state == VideoRepairState.FAILED }
+
+    /** Called off the UI thread. Persist the pre-repair report before arming the decoder request. */
+    @Synchronized fun requestRepair(saveDiagnostics: () -> Unit): String {
+        if (!running) return "投屏已结束"
+        repair.rejection(SystemClock.elapsedRealtime())?.let { return it }
+        try { saveDiagnostics() } catch (_: Exception) { return "诊断保存失败，尚未开始修复，请稍后重试。" }
+        if (!running) return "投屏已结束"
+        val now = SystemClock.elapsedRealtime()
+        if (repair.request(now)) health.event(now, "repair_requested", "pre-repair diagnostics saved; natural IDR only")
+        return repairStatus().message
+    }
     private val worker = Thread(::decode, "WifiScreen-AVC").apply { start() }
 
     fun offer(frame: LegacyFrame, streamTime: String) {
         if (!running || frame.kind !in 0..1) return
         if (frame.kind == 0) {
             received.incrementAndGet()
-            if (LegacyAvc.isKeyframe(frame.data)) keyframes.incrementAndGet()
+            if (LegacyAvc.isKeyframe(frame.data)) {
+                keyframes.incrementAndGet()
+                health.keyframe(SystemClock.elapsedRealtime())
+            }
         }
         // Blocking the TCP reader applies bounded backpressure without losing reference frames.
-        queue.put(Input(frame, streamTime, System.nanoTime()))
+        queue.put(Input(frame, streamTime, System.nanoTime(), SystemClock.elapsedRealtime()))
     }
 
     private fun decode() {
         var codec: MediaCodec? = null
         var configuredSurface: Surface? = null
         var config: AvcConfiguration? = null
+        var sourceSps: AvcSps? = null
+        var sourcePps: AvcPps? = null
+        var codedWidth = 0
+        var codedHeight = 0
         var awaitingKeyframe = true
         var announced = false
         var pending: Input? = null
+        val replay = ArrayDeque<Input>()
+        var repairBlocked = false
+        var lastRepairState = VideoRepairState.IDLE
         val inputArrivals = VideoFrameTracker()
         val outputs = VideoPresentationQueue()
         val syncPolicy = VideoSyncPolicy()
@@ -82,7 +109,7 @@ class LegacyVideo(
         var inputStallSinceNs = 0L
         val presentationClock = VideoPresentationClock()
         val info = MediaCodec.BufferInfo()
-        fun release() {
+        fun release(reason: String) {
             decoderState = "正在重置解码器"
             for (frame in outputs.clear()) {
                 runCatching { codec?.releaseOutputBuffer(frame.index, false) }
@@ -91,6 +118,7 @@ class LegacyVideo(
             presentationQueueDepth = 0; inputStallSinceNs = 0
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
+            if (codec != null) health.released(SystemClock.elapsedRealtime(), reason)
             codec = null
             configuredSurface = null
             awaitingKeyframe = true
@@ -101,6 +129,20 @@ class LegacyVideo(
             inputArrivals.clear(); lastCodecActivityNs = 0
             catchingUp = false; receiverLatencyMs = -1
             decoderState = "等待关键帧"
+        }
+        fun failed(stage: String, failure: Exception) {
+            val now = SystemClock.elapsedRealtime()
+            val detail = if (failure is MediaCodec.CodecException)
+                "${failure.diagnosticInfo}; recoverable=${failure.isRecoverable}; transient=${failure.isTransient}"
+                else "${failure.javaClass.simpleName}: ${failure.message.orEmpty()}"
+            health.event(now, "error", "$stage: $detail")
+            if (repair.snapshot().active || repairBlocked) {
+                repair.fail(now)
+                repairBlocked = true
+                replay.clear(); pending = null
+            }
+            release("$stage 失败")
+            error(stage + "：" + (failure.message ?: failure.javaClass.simpleName))
         }
         // OEM codecs may combine input units or omit output callbacks. The
         // input-minus-output total is not a live queue and must not gate sync.
@@ -146,6 +188,7 @@ class LegacyVideo(
                 if (early) forcedPresentations.incrementAndGet()
                 presented.incrementAndGet()
                 lastPresentedAt = SystemClock.elapsedRealtime()
+                repair.presented(lastPresentedAt)
                 receiverLatencyMs = frame.receivedNs?.let { (releasedAtNs - it) / 1_000_000L } ?: -1
                 if (!announced) { announced = true; firstFrame(frame.width, frame.height) }
             } else {
@@ -170,19 +213,31 @@ class LegacyVideo(
         }
         try {
             while (running) {
+                val nowMs = SystemClock.elapsedRealtime()
+                repair.tick(nowMs)
+                val repairState = repair.snapshot().state
+                if (repairState != lastRepairState) {
+                    health.event(nowMs, "repair_state", repairState.name + ": " + repair.snapshot().message)
+                    if (repairState == VideoRepairState.FAILED) {
+                        repairBlocked = true
+                        replay.clear(); pending = null
+                        release("画面修复失败")
+                    }
+                    if (repairState == VideoRepairState.WAITING) repairBlocked = false
+                    lastRepairState = repairState
+                }
                 var progressed = false
                 if (codec != null) {
                     try { progressed = drainPresentations() }
                     catch (failure: Exception) {
-                        release()
-                        error("视频显示：" + (failure.message ?: failure.javaClass.simpleName))
+                        failed("视频显示", failure)
                     }
                 }
                 // Poll promptly after actual codec activity; idle input metadata
                 // must not keep this thread spinning forever.
                 val waitMs = if (outputs.size > 0) outputs.waitMs(System.nanoTime()) else
                     if (codec == null || System.nanoTime() - lastCodecActivityNs >= 10_000_000L) 5 else 0
-                val input = pending ?: queue.poll(waitMs)
+                val input = pending ?: replay.pollFirst() ?: queue.poll(waitMs)
                 pending = null
                 if (input != null) {
                     val frame = input.frame
@@ -193,9 +248,15 @@ class LegacyVideo(
                             val changed = config?.let { !it.sps.contentEquals(parameters.sps) || !it.pps.contentEquals(parameters.pps) } ?: true
                             config = parameters
                             if (changed) {
+                                sourceSps = AvcParameters.sps(parameters.sps)
+                                sourcePps = AvcParameters.pps(parameters.pps)
+                                health.configuration(SystemClock.elapsedRealtime(), parameters, sourceSps, true)
+                                repair.configurationChanged()
+                                codedWidth = frame.width
+                                codedHeight = frame.height
                                 width = frame.width
                                 height = frame.height
-                                release()
+                                release("视频参数变化")
                                 announced = false
                             }
                         } else {
@@ -209,29 +270,59 @@ class LegacyVideo(
                             if (codec != null && configuredSurface !== target) {
                                 if (Build.VERSION.SDK_INT >= 23) {
                                     try { codec!!.setOutputSurface(target); configuredSurface = target }
-                                    catch (_: Exception) { release() }
-                                } else release()
+                                    catch (failure: Exception) {
+                                        health.event(SystemClock.elapsedRealtime(), "surface_change_failed", failure.javaClass.simpleName)
+                                        release("显示表面切换失败")
+                                    }
+                                } else release("显示表面变化")
                             }
-                            if (awaitingKeyframe && !LegacyAvc.isKeyframe(frame.data)) continue
                             val parameters = config ?: continue
+                            val unit = input.accessUnit ?: LegacyAvc.accessUnit(frame.data, input.streamTime).also { input.accessUnit = it }
+                            if (!input.repairChecked) {
+                                input.repairChecked = true
+                                val isIdr = unit[4].toInt() and 31 == 5
+                                val waiting = repair.snapshot().state == VideoRepairState.WAITING
+                                val slice = if (waiting || isIdr) AvcParameters.slice(unit, sourceSps, sourcePps) else null
+                                if (slice?.idr == true && slice.firstMb == 0) health.idr(input.receivedMs)
+                                if (waiting) {
+                                    val afterRequest = repair.snapshot().requestedAtMs?.let { input.receivedMs > it } == true
+                                    val complete = repair.offer(input, slice, frame.data.size + unit.size,
+                                        SystemClock.elapsedRealtime(), afterRequest)
+                                    if (complete != null) {
+                                        val picture = complete.first().copy(
+                                            accessUnit = AvcParameters.joinIdr(complete.map { it.accessUnit!! }),
+                                            receivedNs = complete.maxOf { it.receivedNs },
+                                            receivedMs = complete.maxOf { it.receivedMs }, repairChecked = true)
+                                        release("用户修复画面")
+                                        replay.addLast(picture)
+                                        replay.addLast(input)
+                                        // Submit the complete IDR in one codec input, then the untouched
+                                        // lookahead unit. Some OEM codecs emit output for each input buffer.
+                                        continue
+                                    }
+                                }
+                            }
+                            if (repairBlocked) continue
+                            if (awaitingKeyframe && !LegacyAvc.isKeyframe(frame.data)) continue
                             presentationClock.observeInput(frame.timeUs, input.receivedNs)
                             if (codec == null) {
                                 decoderState = "正在启动解码器"
-                                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, codedWidth, codedHeight).apply {
                                     setByteBuffer("csd-0", ByteBuffer.wrap(parameters.sps))
                                     setByteBuffer("csd-1", ByteBuffer.wrap(parameters.pps))
                                     if (Build.VERSION.SDK_INT >= 23) setInteger(MediaFormat.KEY_PRIORITY, 0)
                                     if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                                 }
                                 // Avoid adaptive max-width/max-height hints on the target MStar codec.
-                                codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).also {
-                                    codecName = it.name
-                                    it.configure(format, target, null, 0)
-                                    it.start()
-                                }
+                                // Take ownership before configure/start so a failure cannot leak the instance.
+                                codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                                codecName = codec!!.name
+                                codec!!.configure(format, target, null, 0)
+                                codec!!.start()
+                                health.started(SystemClock.elapsedRealtime(), codecName)
+                                repair.started()
                                 configuredSurface = target
                             }
-                            val unit = input.accessUnit ?: LegacyAvc.accessUnit(frame.data, input.streamTime).also { input.accessUnit = it }
                             val index = codec!!.dequeueInputBuffer(0)
                             if (index >= 0) {
                                 decoderState = "正在解码"
@@ -240,6 +331,7 @@ class LegacyVideo(
                                 if (buffer.remaining() < unit.size) throw IllegalArgumentException("Video input buffer too small")
                                 buffer.put(unit)
                                 codec!!.queueInputBuffer(index, 0, unit.size, frame.timeUs, 0)
+                                health.lastInputPtsUs = frame.timeUs
                                 playbackClock?.observeVideo(frame.timeUs, input.receivedNs)
                                 inputArrivals.record(frame.timeUs, input.receivedNs)
                                 lastCodecActivityNs = System.nanoTime()
@@ -256,8 +348,7 @@ class LegacyVideo(
                             }
                         }
                     } catch (failure: Exception) {
-                        release()
-                        error("视频解码：" + (failure.message ?: failure.javaClass.simpleName))
+                        failed("视频解码", failure)
                     }
                 }
                 val current = codec ?: continue
@@ -268,14 +359,16 @@ class LegacyVideo(
                             progressed = true
                             lastCodecActivityNs = System.nanoTime()
                             val receivedNs = inputArrivals.take(info.presentationTimeUs)
+                            health.lastOutputPtsUs = info.presentationTimeUs
                             playbackClock?.observeVideoOutput(info.presentationTimeUs)
                             val nowNs = System.nanoTime()
                             // Keep catch-up state until the real input queue is
                             // drained; precomputing normal pacing here would
                             // reset its preview throttle on every queued frame.
-                            val fallback = if (hasBacklog()) null else
+                            val verifyingRepair = repair.snapshot().state == VideoRepairState.VERIFYING
+                            val fallback = if (verifyingRepair) nowNs else if (hasBacklog()) null else
                                 presentationClock.presentationTime(info.presentationTimeUs, nowNs)
-                            val audioTarget = if (receivedNs != null)
+                            val audioTarget = if (receivedNs != null && !verifyingRepair)
                                 playbackClock?.videoTargetNs(info.presentationTimeUs, nowNs) else null
                             val frame = VideoOutputFrame(index, info.presentationTimeUs, receivedNs, nowNs,
                                 width, height, fallback, audioTarget ?: fallback, audioTarget != null)
@@ -293,6 +386,12 @@ class LegacyVideo(
                         } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                             progressed = true
                             val output = current.outputFormat
+                            fun integer(key: String): Int? = runCatching {
+                                if (output.containsKey(key)) output.getInteger(key) else null
+                            }.getOrNull()
+                            health.format(SystemClock.elapsedRealtime(), VideoFormat(integer("width"), integer("height"),
+                                integer("color-format"), integer("color-standard"), integer("color-transfer"),
+                                integer("color-range"), integer("stride"), integer("slice-height")))
                             width = if (output.containsKey("crop-right"))
                                 output.getInteger("crop-right") - (if (output.containsKey("crop-left")) output.getInteger("crop-left") else 0) + 1 else output.getInteger(MediaFormat.KEY_WIDTH)
                             height = if (output.containsKey("crop-bottom"))
@@ -306,14 +405,13 @@ class LegacyVideo(
                         if (drainPresentations(forceProgress = true)) progressed = true
                     }
                 } catch (failure: Exception) {
-                    release()
-                    error("视频输出：" + (failure.message ?: failure.javaClass.simpleName))
+                    failed("视频输出", failure)
                 }
                 if (!progressed) Thread.sleep(1)
             }
         } catch (_: InterruptedException) {
             // Closing a session interrupts the idle decoder wait.
-        } finally { release(); decoderState = "已停止" }
+        } finally { replay.clear(); release("投屏结束"); repair.stop(SystemClock.elapsedRealtime()); decoderState = "已停止" }
     }
 
     fun close() { running = false; queue.close(); worker.interrupt() }
