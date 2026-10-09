@@ -17,7 +17,7 @@ data class VideoOutputFrame(
 )
 
 /** Owns at most four dequeued codec buffers; callers release every returned frame exactly once. */
-class VideoPresentationQueue(private val capacity: Int = 4, private val maxHoldNs: Long = 200_000_000L) {
+class VideoPresentationQueue(private val capacity: Int = 4, private val maxHoldNs: Long = PlaybackTiming.BUFFER_NS) {
     private val frames = ArrayDeque<VideoOutputFrame>()
     init { require(capacity > 0) }
     val size: Int get() = frames.size

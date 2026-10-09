@@ -105,6 +105,12 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 
 新增 `videoPresented`、`videoPresentedAgeMs`、`videoPresentationQueueDepth`、`videoPresentationHoldMs`、`videoRenderCallMs`、`videoForcedPresentations`，分别观察显示提交、显示进度、待显示输出、持有时间、原生提交耗时和提前显示次数。`videoDecoded` 现在在取到解码输出时增加，待显示帧单独计数；实时 FPS 继续使用实际显示提交数，不改变统计口径。缓冲提前释放时 `videoUsingAudioClock` 为 false，不代表解码停止。
 
+0.2.8 将解码输出持有预算从 200ms 收紧到 20ms。仍保留最多 4 个输出的突发容量，但正常 30fps 不需要攒满队列才释放。预算限制的是应用调度等待，不保证操作系统调度或原生提交也能在 20ms 内完成。
+
+`AudioOutputClock` 先把硬件时间戳外推到播放头的采样时刻，再评估相对偏差；连续有效 300ms 后才采用硬件源。源切换时按不超过经过媒体时间 10% 的幅度校正估计位置，暂时缺少硬件时间戳时保留已测得的输出路径偏移。切换、采样停滞或校正尚未稳定时暂停音频驱动的视频同步，PCM 内容和播放速率不变。超过 40ms 的视频迟到需持续 100ms 且已有其他解码输出才能触发普通同步丢帧；真实音频跳过区间仍按原规则联动视频。
+
+Android 8.0 及以上请求 AudioTrack 低延迟性能模式，构造失败时使用普通模式；系统可忽略请求，使用 `audioPerformanceMode` 观察实际结果。保留平台缓冲探测、额外 20ms 音频缓冲和连续 PCM 原样播放。新增 `audioClockStable`、`audioClockSwitches`、`audioClockCorrectionMs` 用于区分时钟源、切换和校正状态。提前显示会限制同步精度，不能用较低接收端延迟推断音画完全同步。
+
 ## 诊断与实时速率
 
 应用在前台时提供固定只读地址：

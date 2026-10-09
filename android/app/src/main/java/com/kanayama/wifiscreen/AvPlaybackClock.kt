@@ -4,9 +4,12 @@ import java.util.ArrayDeque
 
 object AudioTimestampQuality {
     fun usable(head: Long, frame: Long, written: Long, timestampNs: Long, progressedNs: Long,
-        nowNs: Long, rate: Int): Boolean = frame in 0..written && timestampNs > 0 &&
-        nowNs - timestampNs in 0..100_000_000L && nowNs - progressedNs in 0..100_000_000L &&
-        head - frame in -rate / 50L..rate / 5L
+        nowNs: Long, rate: Int): Boolean {
+        if (frame !in 0..written || timestampNs <= 0 ||
+            nowNs - timestampNs !in 0..100_000_000L || nowNs - progressedNs !in 0..100_000_000L) return false
+        val atNow = minOf(written, frame + (nowNs - timestampNs) * rate / 1_000_000_000L)
+        return head - atNow in -rate / 50L..rate / 5L
+    }
 }
 
 /** Maps actual AudioTrack progress to source media time, including skipped intervals. */
@@ -20,6 +23,7 @@ class AvPlaybackClock {
     private var head = 0L
     private var headAtNs = 0L
     private var started = false
+    private var audioStable = true
     private var audioOriginNs: Long? = null
     private var videoOriginNs: Long? = null
     private var lastVideoPtsUs: Long? = null
@@ -34,7 +38,7 @@ class AvPlaybackClock {
         sample % rate * 1_000_000_000L / rate
 
     @Synchronized fun resetAudio(sampleRate: Int) {
-        rate = sampleRate; written = 0; head = 0; headAtNs = 0; started = false
+        rate = sampleRate; written = 0; head = 0; headAtNs = 0; started = false; audioStable = true
         audioOriginNs = null; spans.clear(); skips.clear(); reportedAudioNs = Long.MIN_VALUE
     }
     @Synchronized fun resetVideo() {
@@ -69,7 +73,9 @@ class AvPlaybackClock {
         }
         written += frames
     }
-    @Synchronized fun updateAudio(playedFrames: Long, nowNs: Long, playing: Boolean) {
+    @Synchronized fun updateAudio(playedFrames: Long, nowNs: Long, playing: Boolean, stable: Boolean = true) {
+        if (!stable || !audioStable) reportedAudioNs = Long.MIN_VALUE
+        audioStable = stable
         val next = playedFrames.coerceIn(0, written)
         if (next != head || playing != started) headAtNs = nowNs
         head = next; started = playing
@@ -92,7 +98,7 @@ class AvPlaybackClock {
         return result
     }
     @Synchronized fun videoTargetNs(ptsUs: Long, nowNs: Long): Long? {
-        if (!videoTimestampReliable) return null
+        if (!videoTimestampReliable || !audioStable) return null
         val videoOrigin = videoOriginNs ?: return null
         val audioOrigin = audioOriginNs ?: return null
         val sample = audioMediaSample(nowNs) ?: return null
@@ -112,7 +118,7 @@ class AvPlaybackClock {
         return nowNs + skew
     }
     @Synchronized fun videoWasSkipped(ptsUs: Long, nowNs: Long): Boolean {
-        if (!videoTimestampReliable || audioMediaSample(nowNs) == null) return false
+        if (!videoTimestampReliable || !audioStable || audioMediaSample(nowNs) == null) return false
         val audioOrigin = audioOriginNs ?: return false
         val videoOrigin = videoOriginNs ?: return false
         val frame = minOf(written, head + (nowNs - headAtNs).coerceAtLeast(0) * rate / 1_000_000_000L)

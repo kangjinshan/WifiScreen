@@ -77,6 +77,7 @@ class LegacyVideo(
         var pending: Input? = null
         val inputArrivals = VideoFrameTracker()
         val outputs = VideoPresentationQueue()
+        val syncPolicy = VideoSyncPolicy()
         var lastCodecActivityNs = 0L
         var inputStallSinceNs = 0L
         val presentationClock = VideoPresentationClock()
@@ -94,6 +95,7 @@ class LegacyVideo(
             configuredSurface = null
             awaitingKeyframe = true
             presentationClock.reset()
+            syncPolicy.reset()
             playbackClock?.resetVideo()
             usingAudioClock = false; audioSkewMs = 0
             inputArrivals.clear(); lastCodecActivityNs = 0
@@ -108,14 +110,17 @@ class LegacyVideo(
             if (frame.usesAudioClock && !frame.syncDrop) {
                 val audioTarget = playbackClock?.videoTargetNs(frame.ptsUs, nowNs)
                 if (audioTarget == null) {
+                    syncPolicy.reset()
                     frame.usesAudioClock = false
                     frame.targetNs = frame.fallbackNs
                 } else {
                     audioSkewMs = (audioTarget - nowNs) / 1_000_000L
-                    frame.syncDrop = audioSkewMs < -40 || playbackClock?.videoWasSkipped(frame.ptsUs, nowNs) == true
+                    frame.syncDrop = syncPolicy.shouldDrop(audioTarget - nowNs, nowNs, outputs.size > 1,
+                        playbackClock?.videoWasSkipped(frame.ptsUs, nowNs) == true)
                     frame.targetNs = if (frame.syncDrop) null else maxOf(audioTarget, nowNs)
                 }
             }
+            if (!frame.usesAudioClock) syncPolicy.reset()
             if (catchUp && !frame.syncDrop) {
                 val waitingForAudio = frame.usesAudioClock && frame.targetNs?.let { it > nowNs } == true
                 frame.usesAudioClock = false

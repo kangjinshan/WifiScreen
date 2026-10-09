@@ -38,6 +38,14 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         private set
     @Volatile var hardwareLagMs = 0L
         private set
+    @Volatile var clockStable = false
+        private set
+    @Volatile var clockSwitches = 0L
+        private set
+    @Volatile var clockCorrectionMs = 0L
+        private set
+    @Volatile var performanceMode = -1
+        private set
     val queueDepth: Int get() = queue.size
     val missingPackets: Long get() = queue.missingPackets
     val reorderedPackets: Long get() = queue.reorderedPackets
@@ -85,6 +93,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
         var previousPlaybackHead = 0L
         var trackPlayedFrames = 0L
         val hardwareTimestamp = AudioTimestamp()
+        val outputClock = AudioOutputClock()
         var timestampPolledAt = 0L
         var hardwareFrame = -1L
         var hardwareAtNs = 0L
@@ -123,6 +132,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
             playing = false; bufferedMs = 0; previousPlaybackHead = 0; trackPlayedFrames = 0
             hardwareClock = false; hardwareFrame = -1; hardwareAtNs = 0; timestampPolledAt = 0
             hardwareProgressAtNs = 0; hardwareLagMs = 0
+            outputClock.reset(); clockStable = false; clockSwitches = 0; clockCorrectionMs = 0
             prerollDeadlineNs = 0; prerollOriginNs = 0
             firstOutputPts = null
             playbackClock.resetAudio(outputRate)
@@ -145,10 +155,11 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
                     }
                 }
                 hardwareLagMs = if (hardwareFrame >= 0) (trackPlayedFrames - hardwareFrame) * 1000 / outputRate else 0
-                hardwareClock = playing && AudioTimestampQuality.usable(trackPlayedFrames, hardwareFrame,
-                    writtenFrames, hardwareAtNs, hardwareProgressAtNs, nowNs, outputRate)
-                if (hardwareClock) playbackClock.updateAudio(hardwareFrame, hardwareAtNs, true)
-                else playbackClock.updateAudio(trackPlayedFrames, nowNs, playing)
+                val reading = outputClock.update(trackPlayedFrames, writtenFrames, hardwareFrame,
+                    hardwareAtNs, hardwareProgressAtNs, nowNs, outputRate, playing)
+                hardwareClock = reading.hardware; clockStable = reading.stable
+                clockSwitches = outputClock.switches; clockCorrectionMs = reading.correctionMs
+                playbackClock.updateAudio(reading.frames, nowNs, playing, reading.stable)
                 if (Build.VERSION.SDK_INT >= 24) underruns = savedUnderruns + output.underrunCount
             }
         }
@@ -164,14 +175,26 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
             val mask = if (outputChannels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
             val bytesPerFrame = outputChannels * 2
             val minimum = AudioTrack.getMinBufferSize(outputRate, mask, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(4096)
-            fun create(size: Int): AudioTrack = if (Build.VERSION.SDK_INT >= 23) AudioTrack.Builder()
-                .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
-                .setAudioFormat(AudioFormat.Builder().setSampleRate(outputRate).setChannelMask(mask)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                .setBufferSizeInBytes(size).setTransferMode(AudioTrack.MODE_STREAM).build()
-            else @Suppress("DEPRECATION") AudioTrack(AudioManager.STREAM_MUSIC, outputRate, mask,
-                AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM)
+            fun create(size: Int): AudioTrack {
+                if (Build.VERSION.SDK_INT >= 23) {
+                    fun build(lowLatency: Boolean): AudioTrack {
+                        val builder = AudioTrack.Builder()
+                            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                            .setAudioFormat(AudioFormat.Builder().setSampleRate(outputRate).setChannelMask(mask)
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                            .setBufferSizeInBytes(size).setTransferMode(AudioTrack.MODE_STREAM)
+                        if (lowLatency && Build.VERSION.SDK_INT >= 26)
+                            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                        return builder.build()
+                    }
+                    return if (Build.VERSION.SDK_INT >= 26) runCatching { build(true) }.getOrElse { build(false) }
+                    else build(false)
+                }
+                @Suppress("DEPRECATION")
+                return AudioTrack(AudioManager.STREAM_MUSIC, outputRate, mask,
+                    AudioFormat.ENCODING_PCM_16BIT, size, AudioTrack.MODE_STREAM)
+            }
             if (baselineRate != outputRate || baselineChannels != outputChannels) {
                 // Keep the device's existing mixer buffer. The user budget is an
                 // additional 20ms, not a replacement for the platform's required buffer.
@@ -183,6 +206,7 @@ class LegacyAudio(private val audible: () -> Boolean, private val error: (String
             platformBufferMs = baselineFrames * 1000 / outputRate
             prerollBytes = baselineFrames * bytesPerFrame + PlaybackTiming.audioPrerollBytes(outputRate, outputChannels)
             return create(prerollBytes).also {
+                performanceMode = if (Build.VERSION.SDK_INT >= 26) it.performanceMode else -1
                 bufferCapacityMs = if (Build.VERSION.SDK_INT >= 23) it.bufferSizeInFrames * 1000 / outputRate
                     else prerollBytes * 1000 / (outputRate * bytesPerFrame)
             }

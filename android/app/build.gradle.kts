@@ -14,8 +14,8 @@ android {
         applicationId = "com.kanayama.wifiscreen"
         minSdk = 21
         targetSdk = 34
-        versionCode = 13
-        versionName = "0.2.7"
+        versionCode = 14
+        versionName = "0.2.8"
     }
     buildFeatures { buildConfig = true }
     if (releaseProperties.isNotEmpty()) {

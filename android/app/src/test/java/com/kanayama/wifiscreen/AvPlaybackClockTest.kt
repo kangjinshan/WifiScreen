@@ -5,10 +5,22 @@ import org.junit.Test
 
 class AvPlaybackClockTest {
     @Test fun stalledOrDistantHardwareTimestampsFallBackToThePlaybackHead() {
-        assertTrue(AudioTimestampQuality.usable(48000, 47000, 50000, 950_000_000, 990_000_000, 1_000_000_000, 48000))
+        assertTrue(AudioTimestampQuality.usable(48000, 46000, 50000, 950_000_000, 990_000_000, 1_000_000_000, 48000))
         assertFalse(AudioTimestampQuality.usable(48000, 0, 50000, 950_000_000, 990_000_000, 1_000_000_000, 48000))
         assertFalse(AudioTimestampQuality.usable(48000, 47000, 50000, 950_000_000, 800_000_000, 1_000_000_000, 48000))
         assertFalse(AudioTimestampQuality.usable(48000, 60000, 50000, 950_000_000, 990_000_000, 1_000_000_000, 48000))
+    }
+    @Test fun unsettledOutputClockSuspendsSyncAndResumesWithoutTheOldPhaseClamp() {
+        val clock = AvPlaybackClock()
+        clock.resetAudio(48000); clock.observeAudio(0, 0); clock.observeVideo(0, 0)
+        clock.appendAudio(0, 48000)
+        clock.updateAudio(9600, 300_000_000, true)
+        assertNotNull(clock.videoTargetNs(200_000, 300_000_000))
+        clock.updateAudio(4800, 320_000_000, true, stable = false)
+        assertNull(clock.videoTargetNs(200_000, 320_000_000))
+        assertFalse(clock.videoWasSkipped(200_000, 320_000_000))
+        clock.updateAudio(5760, 340_000_000, true, stable = true)
+        assertEquals(420_000_000L, clock.videoTargetNs(200_000, 340_000_000))
     }
     @Test fun queuedAudioDoesNotMoveVideoUntilPlaybackStarts() {
         val clock = AvPlaybackClock()

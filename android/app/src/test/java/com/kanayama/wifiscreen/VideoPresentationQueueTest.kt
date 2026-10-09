@@ -10,22 +10,28 @@ class VideoPresentationQueueTest {
     @Test fun waitingForAudioDoesNotPreventDecodingTheNextFrame() {
         val queue = VideoPresentationQueue()
         assertNull(queue.offer(frame(0, 0, 40_000_000)))
-        assertNull(queue.poll(33_333_333))
-        assertNull(queue.offer(frame(1, 33_333_333, 73_333_333)))
+        assertNull(queue.poll(10_000_000))
+        assertNull(queue.offer(frame(1, 10_000_000, 73_333_333)))
         assertEquals(2, queue.size)
-        assertEquals(0, queue.poll(40_000_000)?.index)
-        assertEquals(1, queue.poll(73_333_333)?.index)
+        assertEquals(0, queue.poll(20_000_000)?.index)
+        assertEquals(1, queue.poll(30_000_000)?.index)
     }
-    @Test fun thirtyFpsCanContinueWhileEachFrameWaitsFortyMilliseconds() {
+    @Test fun thirtyFpsWithDistantAudioDeadlinesDoesNotAccumulateFourWaitingFrames() {
         val queue = VideoPresentationQueue()
         val released = mutableListOf<Int>()
-        repeat(300) { index ->
-            val now = index * 1_000_000_000L / 30
-            while (true) released.add((queue.poll(now) ?: break).index)
-            assertNull(queue.offer(frame(index, now, now + 40_000_000)))
-            assertTrue(queue.size <= 2)
+        var index = 0
+        repeat(10001) { ms ->
+            val now = ms * 1_000_000L
+            while (true) {
+                val ready = queue.poll(now) ?: break
+                assertTrue(now - ready.decodedNs <= 20_000_000L)
+                released.add(ready.index)
+            }
+            if (index < 300 && now >= index * 1_000_000_000L / 30) {
+                assertNull(queue.offer(frame(index++, now, now + 180_000_000)))
+            }
+            assertTrue(queue.size <= 1)
         }
-        while (true) released.add((queue.poll(11_000_000_000L) ?: break).index)
         assertEquals((0 until 300).toList(), released)
     }
     @Test fun codecBufferPressureReleasesOldestWithoutLosingOwnership() {
@@ -49,8 +55,8 @@ class VideoPresentationQueueTest {
         val frame = frame(0, 0, 100_000_000)
         queue.offer(frame)
         frame.targetNs = 1_000_000_000
-        assertNull(queue.poll(199_000_000))
-        assertEquals(0, queue.poll(200_000_000)?.index)
+        assertNull(queue.poll(19_000_000))
+        assertEquals(0, queue.poll(20_000_000)?.index)
     }
     @Test fun skippedIntervalsAndExplicitPressureReleaseImmediately() {
         val queue = VideoPresentationQueue()
