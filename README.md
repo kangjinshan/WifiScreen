@@ -6,7 +6,7 @@
 
 **[TV App Store 下载与更新](https://tvstore.jinshanweb.com/app-detail.html?id=9)** · [GitHub Releases](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
-当前源码版本为 **0.3.1**，支持 H.264 / H.265 选择、Xiaomi HyperOS 新版投屏协商和 10 秒设备 / 网络评估，保留此前的画面修复与低延迟功能。安装包以 TV App Store 页面显示的版本为准；GitHub Releases 目前仍为 0.2.1。
+当前源码版本为 **0.3.1**，支持 H.264 / H.265 选择、Xiaomi HyperOS 新版投屏协商和 10 秒设备 / 网络评估，保留此前的画面修复与低延迟功能。可从 TV App Store 或 GitHub Releases 下载发布包，请核对下载页面显示的版本。
 
 ![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
@@ -26,7 +26,7 @@
 
 ## 下载与安装
 
-1. 打开 **[TV App Store 应用页面](https://tvstore.jinshanweb.com/app-detail.html?id=9)**，下载页面显示的最新版 APK。也可从 [GitHub Releases](https://github.com/kangjinshan/WifiScreen/releases) 下载已发布的历史版本。
+1. 打开 **[TV App Store 应用页面](https://tvstore.jinshanweb.com/app-detail.html?id=9)**，下载页面显示的最新版 APK。也可从 [GitHub Releases](https://github.com/kangjinshan/WifiScreen/releases) 下载对应版本的 APK、`SHA256SUMS` 校验文件和 `build-info.json` 源码信息。
 2. 将 APK 复制到 U 盘，插入电视或投影仪，用设备的文件管理器打开 APK 并安装。也可以使用局域网文件传输工具，或在电视浏览器中下载。
 3. 安装完成后，在电视的应用列表中打开 **投屏助手**。
 
