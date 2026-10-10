@@ -42,7 +42,7 @@ class LegacyReceiver(
 ) {
     val name: String get() = identity.getString("display_name", null) ?: displayName
     val isRunning: Boolean get() = running
-    val isReady: Boolean get() = running && discovery != null
+    val isReady: Boolean get() = running && discovery?.isReady == true
     @Volatile var muted = false
         private set
     private val main = Handler(Looper.getMainLooper())
@@ -218,11 +218,12 @@ class LegacyReceiver(
                 workers.execute { receiveAudio(a, token) }
                 val mdns = LegacyDiscovery(bind, host, name, mac, uid, c.localPort, v.localPort, advertiseHevc)
                 val accepted = synchronized(this) {
-                    if (running && generation == token) { discovery = mdns; mdns.updateEncoding(advertiseHevc); true } else false
+                    if (running && generation == token) { discovery = mdns; true } else false
                 }
                 if (!accepted) { mdns.close(); return@execute }
-                Log.i("WifiScreen", "Receiver advertised: " + name)
-                reportState("等待手机投屏")
+                mdns.updateEncoding(advertiseHevc)
+                Log.i("WifiScreen", "Receiver discovery registered: " + name)
+                reportState("正在发布接收设备…")
             } catch (failure: Exception) {
                 runCatching { pendingControl?.close() }
                 runCatching { pendingVideo?.close() }
@@ -407,7 +408,7 @@ class LegacyReceiver(
                             .put("connectionProtocol", current?.protocol ?: "")
                             .put("connected", current != null).put("sourceIp", current?.peer ?: "")
                             .put("sessionSeconds", current?.let { (SystemClock.elapsedRealtime() - it.started) / 1000 } ?: 0)
-                            .put("ready", running && discovery != null).put("playing", current?.hasPicture == true)
+                            .put("ready", isReady).put("playing", current?.hasPicture == true)
                             .put("muted", muted)
                             .put("videoReceived", current?.decoder?.received?.get() ?: 0)
                             .put("videoDecoded", current?.decoder?.decoded?.get() ?: 0)
@@ -604,7 +605,20 @@ class LegacyReceiver(
         if (value == VideoEncoding.H265 && !hevcAvailable) return "这台设备没有可用的 H.265 1080p 解码器。"
         identity.edit().putString("video_encoding", value.name).apply()
         // Current session continues with its own parameter sets. New sessions see the new preference.
-        runCatching { discovery?.updateEncoding(advertiseHevc) }
+        if (running && !setup.isShutdown) {
+            val token = generation
+            setup.execute {
+                if (running && generation == token) runCatching { discovery?.updateEncoding(advertiseHevc) }
+                    .onFailure { failure ->
+                        main.post {
+                            if (running && generation == token) {
+                                lastError = failure.message ?: failure.javaClass.simpleName
+                                stop(); status("设备发现更新失败，正在恢复接收服务")
+                            }
+                        }
+                    }
+            }
+        }
         return null
     }
     @Synchronized fun beginCodecTest(): Boolean {

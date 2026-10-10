@@ -9,6 +9,13 @@ cd android
 
 单元测试覆盖 RTSP / RTP、AVC / HEVC 配置与边界、关键帧处理、编码推荐、旧发送端所需的响应头格式、UTF-8 内容长度、解码消费者变慢时保留帧顺序和正常停止，以及连续 PCM 原样播放、音画时间映射、时钟切换、有界显示调度和画面修复。
 
+## 0.3.2 设备发现回归
+
+- `LegacyDiscoveryTest` 使用真实 JmDNS 与回环地址，覆盖两种编码启动后的同值刷新、探测期间快速切换、就绪后切换与关闭。每次公告等待上限 8 秒，需要允许本机回环 UDP / 多播。
+- 0.3.0 / 0.3.1 的启动流程会在 `registerService` 后立即 `setText`；JmDNS 3.5.9 会清除当前探测任务，造成 `_leboremote` 无法公告，而 AirPlay / RAOP 仍可见。相同值应跳过更新；实际切换应在后台重注册单条发现记录。
+- 通过 mDNS 查询核对 `_leboremote._tcp.local.` 的 PTR、SRV、TXT 和主机 IPv4，端口保持 47110；H.264 为 vv=1 / avformat_support=0，H.265 为 vv=2 / avformat_support=1。公告未完成时 `/status.ready` 应为 false，准备超时仍由既有恢复机制处理。
+- 目标投影更新后，仍需在真实手机列表中确认设备出现并连接；本机回环测试不代替此项。切换首选不得断开正在进行的音视频会话。
+
 ## 0.3.0 编码与 10 秒评估回归
 
 - HEVC 覆盖标准 hvcC 与旧包装、VPS / SPS / PPS 合并、截断与非法长度、缺少参数集、NAL 类型不符、IDR / CRA 识别、同包多 NAL、与 AVC 配置区分；重复配置不应重建解码器。

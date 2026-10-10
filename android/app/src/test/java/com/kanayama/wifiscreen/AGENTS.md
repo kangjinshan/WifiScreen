@@ -12,6 +12,7 @@
 - `LegacyHevcTest`：hvcC / 旧包装、NAL 类型、截断、多 NAL 和第二个头字节参与解密。
 - `LelinkProtocolTest`、`LelinkVideoCipherTest`：独立完整配对向量、连续认证记录、篡改 / 重放、低阶公钥、重复 DID 例外、CBC 跨关键帧与码流变化。
 - `CodecRecommendationTest`：设备性能、硬件 / 软件、未知网络、无响应网关、断网 / 切换和两编码均失败。
+- `LegacyDiscoveryTest`：真实 JmDNS 绑定回环地址，验证 H.264 / H.265 启动同值刷新、探测期间连续切换、就绪后切换和关闭；不向局域网发布测试设备。
 - `AudioRtpQueueTest`、`AudioSampleClockTest`、`AudioContinuityTest`、`AudioOutputClockTest`、`AvPlaybackClockTest`：乱序、时间戳兼容、连续 PCM 字节保持、补偿预算、时钟切换。
 - `PlaybackTimingTest`、`VideoInputQueueTest`、`VideoFrameTrackerTest`、`VideoPresentationQueueTest`、`VideoSyncPolicyTest`：输入背压、分片 PTS、输出所有权、追帧和显示等待。
 - `AvcParametersTest`、`VideoRepairTest`、`VideoDiagnosticsTest`：SPS / PPS / VUI、完整 IDR、超时 / 冷却 / 生命周期和有界不可变历史。
@@ -23,6 +24,8 @@
 密码 / 字节流预期值优先来自独立实现或经过核对的向量，不能用被测函数生成自己的 expected。检查原样播放时保留独立输入副本，避免原地修改掩盖错误。计时与状态机传入逻辑时间，避免靠长 sleep 制造脆弱测试；并发队列测试必须有停止和超时边界。
 
 Android 平台类可出现在业务文件中，但这些测试应聚焦纯逻辑，不依赖虚假的设备解码成功。改协议参数集、时钟、补偿或解密上下文时，选择相应组回归；普通文档发布复用当前有效结果。新增测试后保持向量来源、场景与根开发文档同步。
+
+`LegacyDiscoveryTest` 是库集成回归，使用 JmDNS 自有定时器；每次公告等待上限 8 秒，需要允许本机回环 UDP / 多播。不能以模拟注册成功替代真实公告状态。该测试不证明手机与投影之间的网络可达性。
 
 ## 4. 使用示例或典型调用路径
 

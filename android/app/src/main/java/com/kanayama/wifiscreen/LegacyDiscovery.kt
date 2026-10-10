@@ -3,6 +3,7 @@ package com.kanayama.wifiscreen
 import java.net.InetAddress
 import javax.jmdns.JmDNS
 import javax.jmdns.ServiceInfo
+import javax.jmdns.impl.ServiceInfoImpl
 
 /** IPv4-only service records avoid unscoped link-local IPv6 addresses in older senders. */
 class LegacyDiscovery(
@@ -10,8 +11,10 @@ class LegacyDiscovery(
     controlPort: Int, videoPort: Int, allowHevc: Boolean = false
 ) {
     private val dns = JmDNS.create(address, host)
-    private var remoteInfo: ServiceInfo? = null
+    @Volatile private var remoteInfo: ServiceInfo? = null
     private var remoteProperties = emptyMap<String, String>()
+    // registerService is asynchronous; an allocated JmDNS instance is not yet discoverable.
+    val isReady: Boolean get() = (remoteInfo as? ServiceInfoImpl)?.isAnnounced == true
     init {
         try {
             val remote = mapOf(
@@ -38,13 +41,26 @@ class LegacyDiscovery(
             throw failure
         }
     }
-    fun updateEncoding(hevc: Boolean) {
-        remoteProperties = remoteProperties + encodingProperties(hevc)
-        remoteInfo?.setText(remoteProperties)
+    @Synchronized fun updateEncoding(hevc: Boolean) {
+        val current = remoteInfo ?: return
+        val properties = remoteProperties + encodingProperties(hevc)
+        if (properties == remoteProperties) return
+        // JmDNS 3.5.9 setText detaches the current probe/announce task. During startup
+        // or rapid changes this leaves the service stuck forever with no PTR replies.
+        // Re-register only this record, on the receiver's setup executor, keeping its identity.
+        val replacement = ServiceInfo.create(current.type, current.name, current.port,
+            current.weight, current.priority, properties)
+        dns.unregisterService(current)
+        dns.registerService(replacement)
+        remoteInfo = replacement
+        remoteProperties = properties
     }
     private fun encodingProperties(hevc: Boolean) = mapOf(
         "avformat_support" to if (hevc) "1" else "0", "vv" to if (hevc) "2" else "1",
         "hstv" to if (hevc) "500.0" else "150.33",
         "feature" to if (hevc) "31231" else "162303", "lebofeature" to if (hevc) "31231" else "162303")
-    fun close() { runCatching { dns.unregisterAllServices(); dns.close() } }
+    @Synchronized fun close() {
+        remoteInfo = null
+        runCatching { dns.unregisterAllServices(); dns.close() }
+    }
 }

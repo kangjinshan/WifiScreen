@@ -6,7 +6,7 @@
 
 **[TV App Store 下载与更新](https://tvstore.jinshanweb.com/app-detail.html?id=9)** · [GitHub Releases](https://github.com/kangjinshan/WifiScreen/releases) · [反馈问题](https://github.com/kangjinshan/WifiScreen/issues)
 
-当前源码版本为 **0.3.1**，支持 H.264 / H.265 选择、Xiaomi HyperOS 新版投屏协商和 10 秒设备 / 网络评估，保留此前的画面修复与低延迟功能。可从 TV App Store 或 GitHub Releases 下载发布包，请核对下载页面显示的版本。
+当前源码版本为 **0.3.2**，修复 0.3.0 / 0.3.1 可能显示接收就绪、却不出现在手机列表中的问题。保留 H.264 / H.265 选择、Xiaomi HyperOS 新版投屏协商、10 秒设备 / 网络评估、画面修复与低延迟功能。最新版请通过 TV App Store 更新；GitHub Releases 当前为 0.3.1，请核对下载页面显示的版本。
 
 ![投屏助手 0.2.1 首页：使用经典投屏图标](docs/images/home-0.2.1.png)
 
@@ -91,6 +91,7 @@
 <details>
 <summary><strong>手机投屏列表里找不到设备</strong></summary>
 
+- 如果正在使用 0.3.0 / 0.3.1，请先更新到 0.3.2 或更新版本；旧版的发现问题可能在重新发布后仍然出现。
 - 确认电视已经打开投屏助手，并停留在等待连接页。
 - 确认两台设备在同一局域网，未使用隔离设备的访客网络。
 - 关闭并重新打开手机的投屏列表。

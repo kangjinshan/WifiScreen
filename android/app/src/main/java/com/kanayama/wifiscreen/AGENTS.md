@@ -14,7 +14,7 @@
 | `VideoViewport.kt`、`ReceiverName.kt` | 显示边界、缩放、名称校验与 XML 转义 | `bounds`、`PictureSettings.normalized`、`error`、`xml` |
 | `DeviceProfile.kt`、`DeviceCodecs.kt` | 网络地址、系统权限、可用解码器和诊断 | `addresses`、`report`、`find`；能力存在不等于实测性能 |
 | `LegacyReceiver.kt` | 固定监听端口、HTTP / RTSP、会话、预约、诊断 | `start/stop`、`handle`、`receiveAudio`、`selectEncoding`、`beginCodecTest` |
-| `LegacyDiscovery.kt` | IPv4 mDNS 发现与编码能力公告 | `updateEncoding`；保留端口、身份，更新 vv / hstv / feature |
+| `LegacyDiscovery.kt` | IPv4 mDNS 发现与编码能力公告 | `isReady` 检查公告状态；`updateEncoding` 跳过相同值，在 setup 线程重注册单条记录，保留端口、身份 |
 | `Rtsp.kt`、`LegacyResponse.kt` | 有界头 / body 解析、二进制 body、旧手机兼容响应 | `read`、`encode`；长度按字节，不能宽泛接受重复头 |
 | `LelinkPairing.kt` | v2 开放模式配对、TLV、认证记录 | `handshake`、`LelinkTlv`、`LelinkRecords`；乱序 / 认证失败不可继续 |
 | `LelinkPlist.kt` | v2 镜像控制 plist | `decode/encode`；受限 Apple DTD 仅剥离，不访问网络或外部实体 |
@@ -36,7 +36,8 @@
 
 ## 3. 核心业务流程
 
-- **发现与重连**：`onResume` → `ReceiverRecovery.start/check` → `LegacyReceiver.start` → socket + 多播锁 + `LegacyDiscovery`；失网 / 换地址时停止旧服务并通知 UI。手机自行发起连接，接收端不替用户操作手机。
+- **发现与重连**：`onResume` → `ReceiverRecovery.start/check` → `LegacyReceiver.start` → socket + 多播锁 + `LegacyDiscovery`；`ready` 必须等 `_leboremote` 完成公告，不能仅检查对象存在。失网 / 换地址时停止旧服务并通知 UI。手机自行发起连接，接收端不替用户操作手机。
+- **编码公告更新**：同值刷新直接返回；实际切换由 setup executor 注销 / 重注册 `_leboremote`，保持名称、MAC / UID、端口和现有媒体连接。启动后补读最新首选，排队任务核对 generation；失败交回前台恢复。JmDNS 3.5.9 的 `setText` 会清除当前探测 / 公告任务，不可在启动或快速切换时使用；就绪查询依赖该版本 `ServiceInfoImpl.isAnnounced`，升级库须回归。
 - **旧协议接收**：`handle` 解析握手 → `POST /stream` 直接进入帧通道（不额外回 HTTP 响应）→ `LegacyAvc.frame` → `LegacyVideo.offer`；声音经 `receiveAudio` → `LegacyAudio`。
 - **HyperOS v2**：配对三步 → 已认证能力查询 → 视频 SETUP 预约 → 同来源视频 socket 接入 → `Session`。`avformat_support` 来自首选与设备能力；视频 / 音频 teardown 分别回复。帧解密使用会话的 v2 标识和连续 CBC IV。
 - **视频与声音**：排队 / 解密缓存 → 解码 → 有界显示；声音排序 → 样本位置 → AAC 解码 → 仅确认缺口时补偿 → AudioTrack。`AvPlaybackClock` 将实际声音进度映射回媒体时间，异常偏差回退独立视频节奏。

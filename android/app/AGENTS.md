@@ -8,7 +8,7 @@
 
 ## 2. 核心组件
 
-- `build.gradle.kts`：包名 `com.kanayama.wifiscreen`，最低 API 21 / compileSdk 35 / targetSdk 34；当前版本 0.3.1、versionCode 17。以后以此文件和实际 APK 为准。
+- `build.gradle.kts`：包名 `com.kanayama.wifiscreen`，最低 API 21 / compileSdk 35 / targetSdk 34；当前源码版本 0.3.2、versionCode 18（发布状态另查）。以后以此文件和实际 APK 为准。
 - AndroidX Core / AppCompat 构建界面；`MainActivity` / `CinemaUi` 使用原生 Views 与 DPAD 焦点。
 - `LegacyReceiver` / `LegacyVideo` / `LegacyAudio` 使用平台网络、MediaCodec 与 AudioTrack；JmDNS 提供发现。
 - `LelinkPairing` / `LelinkVideoCipher` 使用标准密码原语，Bouncy Castle 1.80；不要用研究目录的厂商二进制代替。
