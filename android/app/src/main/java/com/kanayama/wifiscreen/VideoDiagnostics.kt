@@ -33,9 +33,12 @@ class VideoDiagnostics(private val sessionStartedMs: Long, private val capacity:
         while (events.size > capacity) events.removeFirst()
     }
     @Synchronized fun configuration(nowMs: Long, parameters: AvcConfiguration, parsed: AvcSps?, changed: Boolean) {
+        configuration(nowMs, listOf(parameters.sps, parameters.pps), parsed, changed)
+    }
+    @Synchronized fun configuration(nowMs: Long, parameters: List<ByteArray>, parsed: AvcSps?, changed: Boolean) {
         if (!changed) return
         version++
-        hash = MessageDigest.getInstance("SHA-256").apply { update(parameters.sps); update(parameters.pps) }
+        hash = MessageDigest.getInstance("SHA-256").apply { parameters.forEach { update(it) } }
             .digest().joinToString("") { "%02x".format(it.toInt() and 255) }
         source = parsed
         event(nowMs, "configuration", "version=$version sha256=$hash source=${parsed ?: "unknown/unsupported"}")

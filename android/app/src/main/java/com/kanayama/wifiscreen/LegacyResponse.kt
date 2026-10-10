@@ -8,7 +8,10 @@ object LegacyResponse {
         "Content-Type", "Content-Length").associateBy { it.lowercase(Locale.ROOT) }
 
     fun encode(protocol: String, status: String, headers: Map<String, String>, body: String): ByteArray {
-        val payload = body.toByteArray(Charsets.UTF_8)
+        return encode(protocol, status, headers, body.toByteArray(Charsets.UTF_8))
+    }
+
+    fun encode(protocol: String, status: String, headers: Map<String, String>, payload: ByteArray): ByteArray {
         val head = buildString {
             append(protocol).append(' ').append(status).append("\r\n")
             headers.forEach { (key, value) ->

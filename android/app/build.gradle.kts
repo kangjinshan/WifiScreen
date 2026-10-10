@@ -14,8 +14,8 @@ android {
         applicationId = "com.kanayama.wifiscreen"
         minSdk = 21
         targetSdk = 34
-        versionCode = 15
-        versionName = "0.2.9"
+        versionCode = 17
+        versionName = "0.3.1"
     }
     buildFeatures { buildConfig = true }
     if (releaseProperties.isNotEmpty()) {
@@ -41,5 +41,6 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("org.jmdns:jmdns:3.5.9")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.80")
     testImplementation("junit:junit:4.13.2")
 }

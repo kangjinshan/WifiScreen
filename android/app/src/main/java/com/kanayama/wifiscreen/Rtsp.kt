@@ -6,11 +6,12 @@ import java.io.InputStream
 import java.io.IOException
 import java.util.Locale
 
-data class RtspMessage(val startLine: String, val headers: Map<String, String>, val body: String = "") {
+data class RtspMessage(val startLine: String, val headers: Map<String, String>, val body: String = "",
+    val binaryBody: ByteArray? = null) {
     fun header(name: String): String? = headers[name.lowercase(Locale.ROOT)]
     fun bytes(): ByteArray {
         require(!startLine.contains('\r') && !startLine.contains('\n'))
-        val payload = body.toByteArray(Charsets.UTF_8)
+        val payload = binaryBody ?: body.toByteArray(Charsets.UTF_8)
         val head = buildString {
             append(startLine).append("\r\n")
             headers.filterKeys { !it.equals("content-length", true) }.forEach { (key, value) ->
@@ -29,7 +30,7 @@ object Rtsp {
     const val MAX_HEADER = 16 * 1024
     const val MAX_BODY = 64 * 1024
 
-    fun read(input: InputStream): RtspMessage? {
+    fun read(input: InputStream, allowRepeatedLelinkDid: Boolean = false): RtspMessage? {
         val head = ByteArrayOutputStream()
         var suffix = 0
         while (suffix != 0x0d0a0d0a) {
@@ -48,8 +49,14 @@ object Rtsp {
             val separator = line.indexOf(':')
             if (separator <= 0) throw IOException("Malformed RTSP header")
             val key = line.substring(0, separator).trim().lowercase(Locale.ROOT)
-            if (headers.containsKey(key)) throw IOException("Duplicate RTSP header: " + key)
-            headers[key] = line.substring(separator + 1).trim()
+            val value = line.substring(separator + 1).trim()
+            if (headers.containsKey(key)) {
+                // HyperOS MiLink 17.2.6 writes this same informational field twice.
+                // Only authenticated v2 requests opt in; framing/session headers remain strict.
+                if (allowRepeatedLelinkDid && key == "lelink-client-did" && headers[key] == value) continue
+                throw IOException("Duplicate RTSP header: " + key)
+            }
+            headers[key] = value
         }
         val length = headers["content-length"]?.let {
             it.toIntOrNull() ?: throw IOException("Invalid Content-Length")
@@ -62,7 +69,7 @@ object Rtsp {
             if (count < 0) throw EOFException("Incomplete RTSP body")
             if (count > 0) offset += count
         }
-        return RtspMessage(lines.first(), headers, String(body, Charsets.UTF_8))
+        return RtspMessage(lines.first(), headers, String(body, Charsets.UTF_8), body)
     }
 
     fun parameters(body: String): Map<String, String> = body.lineSequence().mapNotNull { line ->

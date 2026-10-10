@@ -14,7 +14,8 @@ class LegacyVideo(
     private val surface: () -> Surface?,
     private val firstFrame: (Int, Int) -> Unit,
     private val error: (String) -> Unit,
-    private val playbackClock: AvPlaybackClock? = null
+    private val playbackClock: AvPlaybackClock? = null,
+    private val cipherName: String = LegacyAvc.LEGACY_CIPHER
 ) {
     private data class Input(val frame: LegacyFrame, val streamTime: String, val receivedNs: Long,
         val receivedMs: Long, var accessUnit: ByteArray? = null, var repairChecked: Boolean = false)
@@ -57,6 +58,8 @@ class LegacyVideo(
         private set
     @Volatile var codecName = ""
         private set
+    @Volatile var encoding: VideoEncoding? = null
+        private set
     private val health = VideoDiagnostics(SystemClock.elapsedRealtime())
     private val repair = VideoRepair<Input>()
     fun diagnosticSnapshot(): VideoDiagnosticSnapshot = health.snapshot(SystemClock.elapsedRealtime())
@@ -66,6 +69,7 @@ class LegacyVideo(
     /** Called off the UI thread. Persist the pre-repair report before arming the decoder request. */
     @Synchronized fun requestRepair(saveDiagnostics: () -> Unit): String {
         if (!running) return "投屏已结束"
+        if (encoding == VideoEncoding.H265) return "H.265 画面修复暂需在手机断开后重新投屏。"
         repair.rejection(SystemClock.elapsedRealtime())?.let { return it }
         try { saveDiagnostics() } catch (_: Exception) { return "诊断保存失败，尚未开始修复，请稍后重试。" }
         if (!running) return "投屏已结束"
@@ -73,16 +77,12 @@ class LegacyVideo(
         if (repair.request(now)) health.event(now, "repair_requested", "pre-repair diagnostics saved; natural IDR only")
         return repairStatus().message
     }
-    private val worker = Thread(::decode, "WifiScreen-AVC").apply { start() }
+    private val worker = Thread(::decode, "WifiScreen-Video").apply { start() }
 
     fun offer(frame: LegacyFrame, streamTime: String) {
         if (!running || frame.kind !in 0..1) return
         if (frame.kind == 0) {
             received.incrementAndGet()
-            if (LegacyAvc.isKeyframe(frame.data)) {
-                keyframes.incrementAndGet()
-                health.keyframe(SystemClock.elapsedRealtime())
-            }
         }
         // Blocking the TCP reader applies bounded backpressure without losing reference frames.
         queue.put(Input(frame, streamTime, System.nanoTime(), SystemClock.elapsedRealtime()))
@@ -91,9 +91,10 @@ class LegacyVideo(
     private fun decode() {
         var codec: MediaCodec? = null
         var configuredSurface: Surface? = null
-        var config: AvcConfiguration? = null
+        var config: VideoConfiguration? = null
         var sourceSps: AvcSps? = null
         var sourcePps: AvcPps? = null
+        val v2Cipher = if (cipherName == LegacyAvc.V2_CIPHER) LelinkVideoCipher() else null
         var codedWidth = 0
         var codedHeight = 0
         var awaitingKeyframe = true
@@ -244,13 +245,14 @@ class LegacyVideo(
                     try {
                         if (frame.kind == 1) {
                             progressed = true
-                            val parameters = LegacyAvc.configuration(frame.data)
-                            val changed = config?.let { !it.sps.contentEquals(parameters.sps) || !it.pps.contentEquals(parameters.pps) } ?: true
+                            val parameters = VideoConfiguration.parse(frame.data)
+                            val changed = !parameters.sameAs(config)
                             config = parameters
+                            encoding = parameters.encoding
                             if (changed) {
-                                sourceSps = AvcParameters.sps(parameters.sps)
-                                sourcePps = AvcParameters.pps(parameters.pps)
-                                health.configuration(SystemClock.elapsedRealtime(), parameters, sourceSps, true)
+                                sourceSps = if (encoding == VideoEncoding.H264) AvcParameters.sps(parameters.csd[0]) else null
+                                sourcePps = if (encoding == VideoEncoding.H264) AvcParameters.pps(parameters.csd[1]) else null
+                                health.configuration(SystemClock.elapsedRealtime(), parameters.csd, sourceSps, true)
                                 repair.configurationChanged()
                                 codedWidth = frame.width
                                 codedHeight = frame.height
@@ -277,8 +279,24 @@ class LegacyVideo(
                                 } else release("显示表面变化")
                             }
                             val parameters = config ?: continue
-                            val unit = input.accessUnit ?: LegacyAvc.accessUnit(frame.data, input.streamTime).also { input.accessUnit = it }
-                            if (!input.repairChecked) {
+                            val keyframe = if (parameters.encoding == VideoEncoding.H265) LegacyHevc.isKeyframe(frame.data)
+                                else LegacyAvc.isKeyframe(frame.data)
+                            val encrypted = cipherName == LegacyAvc.LEGACY_CIPHER || frame.flags != 0
+                            val unit = input.accessUnit ?: run {
+                                val encryptedKey = encrypted && if (parameters.encoding == VideoEncoding.H265)
+                                    parameters.legacyHevc && frame.data.size >= 6 && LegacyHevc.type(frame.data[4]) == 19
+                                    else LegacyAvc.isKeyframe(frame.data)
+                                val picture = if (v2Cipher != null && encryptedKey)
+                                    v2Cipher.clearPicture(frame.data, input.streamTime) else frame.data
+                                if (parameters.encoding == VideoEncoding.H265)
+                                    LegacyHevc.accessUnit(picture, input.streamTime, parameters.legacyHevc, cipherName,
+                                        parameters.legacyHevc && encrypted && v2Cipher == null)
+                                else LegacyAvc.accessUnit(picture, input.streamTime, cipherName, encrypted && v2Cipher == null)
+                            }.also {
+                                    input.accessUnit = it
+                                    if (keyframe) { keyframes.incrementAndGet(); health.keyframe(input.receivedMs) }
+                                }
+                            if (!input.repairChecked && parameters.encoding == VideoEncoding.H264) {
                                 input.repairChecked = true
                                 val isIdr = unit[4].toInt() and 31 == 5
                                 val waiting = repair.snapshot().state == VideoRepairState.WAITING
@@ -303,19 +321,20 @@ class LegacyVideo(
                                 }
                             }
                             if (repairBlocked) continue
-                            if (awaitingKeyframe && !LegacyAvc.isKeyframe(frame.data)) continue
+                            if (awaitingKeyframe && !keyframe) continue
                             presentationClock.observeInput(frame.timeUs, input.receivedNs)
                             if (codec == null) {
                                 decoderState = "正在启动解码器"
-                                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, codedWidth, codedHeight).apply {
-                                    setByteBuffer("csd-0", ByteBuffer.wrap(parameters.sps))
-                                    setByteBuffer("csd-1", ByteBuffer.wrap(parameters.pps))
+                                val format = MediaFormat.createVideoFormat(parameters.encoding.mime, codedWidth, codedHeight).apply {
+                                    parameters.csd.forEachIndexed { index, bytes -> setByteBuffer("csd-$index", ByteBuffer.wrap(bytes)) }
                                     if (Build.VERSION.SDK_INT >= 23) setInteger(MediaFormat.KEY_PRIORITY, 0)
                                     if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                                 }
                                 // Avoid adaptive max-width/max-height hints on the target MStar codec.
                                 // Take ownership before configure/start so a failure cannot leak the instance.
-                                codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                                val device = DeviceCodecs.find(parameters.encoding, codedWidth, codedHeight)
+                                    ?: throw IllegalStateException("设备不支持 ${parameters.encoding.label} ${codedWidth}×${codedHeight}，请选 H.264 后重新投屏")
+                                codec = MediaCodec.createByCodecName(device.name)
                                 codecName = codec!!.name
                                 codec!!.configure(format, target, null, 0)
                                 codec!!.start()

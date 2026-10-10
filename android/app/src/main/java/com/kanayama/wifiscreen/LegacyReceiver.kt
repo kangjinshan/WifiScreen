@@ -11,6 +11,7 @@ import android.util.Log
 import android.util.AtomicFile
 import android.view.Surface
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.EOFException
@@ -31,7 +32,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.pow
 
-/** Independent legacy LAN receiver: discovery, HTTP/RTSP session, AVC and AAC-ELD. */
+/** Independent legacy LAN receiver: discovery, HTTP/RTSP session, AVC/HEVC and AAC-ELD. */
 class LegacyReceiver(
     private val context: Context,
     private val surface: () -> Surface?,
@@ -49,6 +50,9 @@ class LegacyReceiver(
     private var workers = Executors.newCachedThreadPool()
     private val sockets = Collections.synchronizedSet(mutableSetOf<Socket>())
     private val controlByPeer = Collections.synchronizedMap(mutableMapOf<String, Socket>())
+    private data class PendingMirror(val control: Socket, val sessionId: String, val streamTime: String,
+        val uri: String, val createdMs: Long)
+    private val pendingMirrors = mutableMapOf<String, PendingMirror>()
     private var control: ServerSocket? = null
     private var video: ServerSocket? = null
     private var audio: DatagramSocket? = null
@@ -61,6 +65,7 @@ class LegacyReceiver(
     @Volatile private var lastReport = "尚未接收投屏"
     @Volatile private var lastError = ""
     @Volatile private var lastHandshake = ""
+    @Volatile private var lastProtocolError = ""
     private val repairReportFile = AtomicFile(File(context.filesDir, "last-video-repair.txt"))
     @Volatile private var lastRepairReport = runCatching {
         repairReportFile.openRead().bufferedReader().use { it.readText().take(65_536) }
@@ -68,6 +73,15 @@ class LegacyReceiver(
     @Volatile var address = ""
         private set
     private val identity = context.getSharedPreferences("receiver", Context.MODE_PRIVATE)
+    val preferredEncoding: VideoEncoding get() = VideoEncoding.saved(identity.getString("video_encoding", null))
+    val actualEncoding: VideoEncoding? get() = active?.takeUnless { it.closed }?.decoder?.encoding
+    val encodingSummary: String get() = actualEncoding?.let {
+        if (it == preferredEncoding) "实际 ${it.label}" else "实际 ${it.label}（首选 ${preferredEncoding.label} 未采用）"
+    } ?: "首选 ${preferredEncoding.label} · 等待连接"
+    private val hevcAvailable by lazy { DeviceCodecs.find(VideoEncoding.H265) != null }
+    private val advertiseHevc: Boolean get() = preferredEncoding == VideoEncoding.H265 && hevcAvailable
+    @Volatile var codecTestRunning = false
+        private set
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     // One-time migration from 0.1.0: Xiaomi retains a receiver's first discovered port.
     // A new identity lets existing phones discard the old ephemeral endpoint.
@@ -79,7 +93,8 @@ class LegacyReceiver(
     private val host = "wifiscreen-" + id.take(8)
     private val deviceReport by lazy { DeviceProfile.report(context) }
 
-    private inner class Session(val peer: String, val videoSocket: Socket, val controlSocket: Socket?) {
+    private inner class Session(val peer: String, val videoSocket: Socket, val controlSocket: Socket?,
+        val protocol: String = "legacy", val lelinkId: String = "", val uri: String = "") {
         val id = sessionIds.incrementAndGet()
         val receivedBytes = AtomicLong()
         val started = SystemClock.elapsedRealtime()
@@ -106,7 +121,8 @@ class LegacyReceiver(
                     rendered(width, height)
                 }
             }
-        }, { failure -> if (!closed && active === this) { lastError = failure; reportState(failure) } }, playbackClock)
+        }, { failure -> if (!closed && active === this) { lastError = failure; reportState(failure) } }, playbackClock,
+            if (protocol == "lelink-v2") LegacyAvc.V2_CIPHER else LegacyAvc.LEGACY_CIPHER)
         val sound = LegacyAudio({ hasPicture && audioAllowed && !closed }, { failure ->
             if (!closed && active === this) lastError = failure
         }, playbackClock)
@@ -118,6 +134,8 @@ class LegacyReceiver(
             "\n视频输出：" + decoder.decoded.get() + " 帧" +
             "\n视频已显示：" + decoder.presented.get() + " 帧" +
             "\n视频尺寸：" + decoder.width + " × " + decoder.height +
+            "\n视频编码：" + (decoder.encoding?.label ?: "等待参数") + "\n首选编码：" + preferredEncoding.label +
+            "\n投屏协议：" + protocol +
             "\n解码状态：" + decoder.decoderState +
             "\n队列深度：" + decoder.queueDepth + "\n缓冲等待：" + decoder.backpressureWaits +
             "\n视频正在追帧：" + decoder.catchingUp + "\n画面接收至显示：" + decoder.receiverLatencyMs + " ms" +
@@ -138,14 +156,15 @@ class LegacyReceiver(
             "\n\n视频诊断（源颜色字段为 H.264 值，输出颜色字段为 Android 值；null 表示未知）：\n" +
             decoder.diagnosticSnapshot().toJson().toString(2) +
             "\n画面修复：\n" + decoder.repairStatus().toJson().toString(2)
-        fun close() {
+        fun close(closeControl: Boolean = true) {
             if (closed) return
             closed = true
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(focusListener)
             lastReport = report()
             decoder.close(); sound.close()
-            runCatching { videoSocket.close() }; runCatching { controlSocket?.close() }
+            runCatching { videoSocket.close() }
+            if (closeControl) runCatching { controlSocket?.close() }
         }
     }
 
@@ -197,9 +216,9 @@ class LegacyReceiver(
                 workers.execute { accept(c, token) }
                 workers.execute { accept(v, token) }
                 workers.execute { receiveAudio(a, token) }
-                val mdns = LegacyDiscovery(bind, host, name, mac, uid, c.localPort, v.localPort)
+                val mdns = LegacyDiscovery(bind, host, name, mac, uid, c.localPort, v.localPort, advertiseHevc)
                 val accepted = synchronized(this) {
-                    if (running && generation == token) { discovery = mdns; true } else false
+                    if (running && generation == token) { discovery = mdns; mdns.updateEncoding(advertiseHevc); true } else false
                 }
                 if (!accepted) { mdns.close(); return@execute }
                 Log.i("WifiScreen", "Receiver advertised: " + name)
@@ -230,6 +249,9 @@ class LegacyReceiver(
         val peer = socket.inetAddress.hostAddress.orEmpty()
         var session: Session? = null
         var streamTime = ""
+        var pairing: LelinkPairing? = null
+        var v2Requested = false
+        var lastRequestAt = SystemClock.elapsedRealtime()
         try {
             socket.soTimeout = 60000
             socket.tcpNoDelay = true
@@ -237,9 +259,29 @@ class LegacyReceiver(
             val output = BufferedOutputStream(socket.getOutputStream())
             while (running && generation == token) {
                 val prefix = ByteArray(4)
-                DataInputStream(input).readFully(prefix)
+                val first = try { input.read() } catch (_: SocketTimeoutException) {
+                    // V2's mirror control can be silent while TCP video/audio continue.
+                    val hasMirror = active?.let { !it.closed && it.protocol == "lelink-v2" && it.peer == peer } == true
+                    if (pairing?.ready == true && (hasMirror || SystemClock.elapsedRealtime() - lastRequestAt < 60_000)) continue
+                    break
+                }
+                if (first < 0) break
+                prefix[0] = first.toByte()
+                // A timeout inside a partial prefix is a framing failure, never restart parsing it.
+                DataInputStream(input).readFully(prefix, 1, 3)
                 val verb = String(prefix, Charsets.US_ASCII)
-                if (verb !in listOf("GET ", "POST", "OPTI", "ANNO", "SETU", "RECO", "GET_", "SET_", "TEAR")) {
+                val encryptedRequest = pairing?.ready == true
+                if (!encryptedRequest && verb !in listOf("GET ", "POST", "OPTI", "ANNO", "SETU", "RECO", "GET_", "SET_", "TEAR")) {
+                    if (session == null && socket.localPort == VIDEO_PORT) synchronized(this) {
+                        purgePendingMirrors()
+                        val pending = pendingMirrors.remove(peer) ?: throw IOException("Video has no verified setup")
+                        if (codecTestRunning || active?.closed == false) throw IOException("Receiver busy")
+                        streamTime = pending.streamTime
+                        muted = false; lastError = ""; lastProtocolError = ""
+                        session = Session(peer, socket, pending.control, "lelink-v2", pending.sessionId, pending.uri)
+                        active = session
+                        reportState("手机已通过新版协商，正在接收画面…")
+                    }
                     val owner = session ?: throw IOException("Video arrived before stream setup")
                     val header = ByteArray(LegacyAvc.HEADER_SIZE)
                     prefix.copyInto(header)
@@ -250,9 +292,21 @@ class LegacyReceiver(
                     owner.decoder.offer(LegacyAvc.frame(header, payload), streamTime)
                     continue
                 }
-                input.unread(prefix)
-                val request = Rtsp.read(input) ?: break
+                val request = if (encryptedRequest) {
+                    val size = LelinkRecords.size(prefix)
+                    val record = ByteArray(size + 20)
+                    prefix.copyInto(record)
+                    DataInputStream(input).readFully(record, 4, record.size - 4)
+                    val plain = ByteArrayInputStream(pairing!!.decrypt(record))
+                    val message = Rtsp.read(plain, allowRepeatedLelinkDid = true) ?: throw IOException("Empty encrypted request")
+                    if (plain.available() != 0) throw IOException("Multiple requests in encrypted record")
+                    message
+                } else {
+                    input.unread(prefix)
+                    Rtsp.read(input) ?: break
+                }
                 val parts = request.startLine.split(" ")
+                lastRequestAt = SystemClock.elapsedRealtime()
                 if (parts.size != 3 || parts[2] !in listOf("HTTP/1.1", "RTSP/1.0", "HTTP/1.0")) throw IOException("Invalid request line")
                 val method = parts[0]
                 val path = parts[1]
@@ -261,11 +315,84 @@ class LegacyReceiver(
                     " " + path.substringBefore('?').take(64) else " RTSP"
                 request.header("stream-time")?.let { streamTime = it }
                 var body = ""
+                var binaryBody: ByteArray? = null
                 var type = "text/parameters"
                 var result = "200 OK"
                 val extra = linkedMapOf("server" to "WifiScreen/0.1")
                 request.header("cseq")?.let { extra["cseq"] = it }
+                val lelinkSession = request.header("lelink-session-id").orEmpty().take(128)
+                val v2Control = encryptedRequest && socket.localPort == CONTROL_PORT
                 when {
+                    path == "/lelink-player-info" && method == "GET" -> {
+                        v2Requested = true
+                        body = LelinkPlist.encode(mapOf("name" to name, "deviceid" to mac, "vv" to "2", "atv" to 0,
+                            "htv" to 1, "hstv" to "500.0", "feature" to 31231,
+                            "mst" to 1, "ast" to 1, "avformat_support" to if (advertiseHevc) 1 else 0,
+                            "displays" to listOf(mapOf("width" to 1920, "height" to 1080, "refresh-rate" to 60.0))))
+                        type = "application/plist+xml"
+                    }
+                    path in listOf("/lelink-setup", "/lelink-verify") && method == "POST" -> {
+                        v2Requested = true
+                        if (encryptedRequest || socket.localPort != CONTROL_PORT) throw IOException("Unexpected pairing channel")
+                        val pair = pairing ?: LelinkPairing().also { pairing = it }
+                        binaryBody = pair.handshake(path, request.binaryBody ?: ByteArray(0))
+                        type = "application/octet-stream"
+                    }
+                    path.startsWith("/lelink-") && !v2Control -> {
+                        v2Requested = true
+                        result = "403 Forbidden"
+                    }
+                    v2Control && method == "POST" && path in listOf("/lelink-connect", "/lelink-reconnect") -> {
+                        if (lelinkSession.isEmpty()) throw IOException("Missing Lelink session")
+                        body = LelinkPlist.encode(mapOf("feature" to "31231"))
+                        type = "application/plist+xml"
+                    }
+                    v2Control && method == "POST" && path == "/passth-reverse" -> {
+                        result = "101 Switching Protocols"
+                        extra["upgrade"] = "event"
+                        extra["connection"] = "Upgrade"
+                    }
+                    v2Control && method == "SETUP" -> {
+                        if (lelinkSession.isEmpty()) throw IOException("Missing Lelink session")
+                        val parameters = LelinkPlist.decode(request.body)
+                        val streams = parameters["streams"] as? List<*> ?: throw IOException("Missing mirror streams")
+                        val videoRequested = streams.any { (it as? Map<*, *>)?.get("type") == 97L }
+                        val audioRequested = streams.any { (it as? Map<*, *>)?.get("type") == 96L }
+                        if (videoRequested == audioRequested) throw IOException("Invalid mirror setup")
+                        if (audioRequested && streams.filterIsInstance<Map<*, *>>().filter { it["type"] == 96L }
+                                .any { it["sample-rate"] != 44100L || it["sample-format"] != 212L })
+                            throw IOException("Unsupported mirror audio format")
+                        synchronized(this) {
+                            purgePendingMirrors()
+                            if (codecTestRunning) result = "503 Service Unavailable"
+                            else if (videoRequested) {
+                                val time = (parameters["stream-time"] as? String)?.takeIf { it.isNotEmpty() && it.length <= 128 }
+                                    ?: throw IOException("Missing mirror stream time")
+                                if (active?.closed == false || pendingMirrors.values.any { it.control !== socket })
+                                    result = "453 Not Enough Bandwidth"
+                                else pendingMirrors[peer] = PendingMirror(socket, lelinkSession, time,
+                                    (parameters["uuid"] as? String).orEmpty().take(512), SystemClock.elapsedRealtime())
+                            } else if (!hasV2Mirror(peer, lelinkSession))
+                                result = "454 Session Not Found"
+                        }
+                        if (result == "200 OK") {
+                            body = LelinkPlist.encode(mapOf("timing-port" to 0, "streams" to listOf(mapOf(
+                                "type" to if (videoRequested) 97 else 96,
+                                "data-port" to if (videoRequested) VIDEO_PORT else AUDIO_PORT,
+                                "max-seq-num" to 10000))))
+                        }
+                        type = "application/plist+xml"
+                    }
+                    v2Control && method == "RECORD" -> {
+                        if (!hasV2Mirror(peer, lelinkSession)) result = "454 Session Not Found"
+                    }
+                    v2Control && (method == "TEARDOWN" || path in listOf(
+                        "/lelink-mirrormode", "/lelink-feedback", "/lelink-streaming", "/lelink-reverse", "/lelink-disconnect", "/lelink-stop")) -> Unit
+                    v2Control && path in listOf("/lelink-retieve-play-info", "/lelink-playinfo", "/lelink-get-property") -> {
+                        body = LelinkPlist.encode(mapOf("cast-type" to if (active?.hasPicture == true) "mirror" else "idle",
+                            "item" to mapOf("uri" to (active?.takeUnless { it.closed }?.uri ?: ""))))
+                        type = "application/plist+xml"
+                    }
                     method == "GET" && path in listOf("/", "/diagnostics") -> {
                         body = diagnostics()
                         type = "text/plain; charset=utf-8"
@@ -276,6 +403,8 @@ class LegacyReceiver(
                             .put("android", Build.VERSION.RELEASE).put("model", Build.MODEL)
                             .put("controlPort", CONTROL_PORT).put("videoPort", VIDEO_PORT).put("audioPort", AUDIO_PORT)
                             .put("lastHandshake", lastHandshake)
+                            .put("lastProtocolError", lastProtocolError)
+                            .put("connectionProtocol", current?.protocol ?: "")
                             .put("connected", current != null).put("sourceIp", current?.peer ?: "")
                             .put("sessionSeconds", current?.let { (SystemClock.elapsedRealtime() - it.started) / 1000 } ?: 0)
                             .put("ready", running && discovery != null).put("playing", current?.hasPicture == true)
@@ -289,6 +418,9 @@ class LegacyReceiver(
                             .put("videoRenderCallMs", current?.decoder?.renderCallMs ?: 0)
                             .put("videoForcedPresentations", current?.decoder?.forcedPresentations?.get() ?: 0)
                             .put("videoCodec", current?.decoder?.codecName ?: "")
+                            .put("preferredVideoEncoding", preferredEncoding.name)
+                            .put("videoEncoding", current?.decoder?.encoding?.name ?: "")
+                            .put("codecTestRunning", codecTestRunning)
                             .put("videoDiagnostics", current?.decoder?.diagnosticSnapshot()?.toJson() ?: JSONObject.NULL)
                             .put("videoRepair", current?.decoder?.repairStatus()?.toJson() ?: JSONObject.NULL)
                             .put("videoRepairReportAvailable", lastRepairReport.isNotEmpty())
@@ -353,12 +485,20 @@ class LegacyReceiver(
                         if (path == "/stream") controlByPeer[peer] = socket
                         body = plist("<key>width</key><integer>1920</integer><key>height</key><integer>1080</integer>" +
                             "<key>refreshRate</key><real>60.0</real><key>overscanned</key><false/>" +
+                            // Extension for senders that negotiate HEVC. vv=1 clients may ignore it;
+                            // keep their transport intact and report the actual received encoding.
+                            "<key>avformat_support</key><integer>" + (if (advertiseHevc) 1 else 0) + "</integer>" +
                             "<key>streams</key><array><dict><key>type</key><integer>110</integer>" +
                             "<key>dataPort</key><integer>" + (video?.localPort ?: 0) + "</integer></dict></array>")
                         type = "text/x-apple-plist+xml"
                     }
                     method == "POST" && path == "/stream" -> {
                         synchronized(this) {
+                            if (codecTestRunning) {
+                                output.write(LegacyResponse.encode(protocol, "503 Service Unavailable", extra,
+                                    "Codec test in progress; reconnect after the test.")); output.flush()
+                                return
+                            }
                             if (active != null && active?.peer != peer) throw IOException("Receiver busy")
                             active?.close()
                             lastError = ""
@@ -394,19 +534,33 @@ class LegacyReceiver(
                 }
                 extra["content-type"] = type
                 extra["content-length"] = body.toByteArray(Charsets.UTF_8).size.toString()
-                output.write(LegacyResponse.encode(protocol, result, extra, body)); output.flush()
+                val response = LegacyResponse.encode(protocol, result, extra, binaryBody ?: body.toByteArray(Charsets.UTF_8))
+                output.write(if (encryptedRequest) pairing!!.encrypt(response) else response); output.flush()
+                if (pairing?.ready == true) socket.soTimeout = 1000
+                if (v2Control && (method == "TEARDOWN" || path in listOf("/lelink-stop", "/lelink-disconnect"))) {
+                    synchronized(this) {
+                        if (pendingMirrors[peer]?.sessionId == lelinkSession) pendingMirrors.remove(peer)
+                        active?.takeIf { it.peer == peer && it.lelinkId == lelinkSession }?.close(closeControl = false)
+                    }
+                    // Keep the authenticated control channel for the sender's audio teardown.
+                    continue
+                }
                 if (method == "TEARDOWN" || path == "/stop") {
-                    active?.takeIf { it.peer == peer }?.close()
+                    active?.takeIf { it.peer == peer && it.protocol == "legacy" }?.close()
                     break
                 }
             }
         } catch (_: EOFException) {
         } catch (failure: Exception) {
+            if (v2Requested && running && !socket.isClosed)
+                lastProtocolError = (failure.message ?: failure.javaClass.simpleName).take(180)
             if (session != null && !session!!.closed && running) lastError = failure.message ?: failure.javaClass.simpleName
         } finally {
             sockets.remove(socket)
             runCatching { socket.close() }
             synchronized(this) {
+                pendingMirrors.entries.removeAll { it.value.control === socket }
+                active?.takeIf { it.protocol == "lelink-v2" && it.controlSocket === socket }?.close()
                 if (controlByPeer[peer] === socket) controlByPeer.remove(peer)
                 session?.close()
                 if (session != null && active === session) {
@@ -446,6 +600,29 @@ class LegacyReceiver(
             session?.sound?.errorMessage.orEmpty(), lastError, session?.sound?.playing == true)
     }
     fun mute(value: Boolean) { muted = value; active?.applyVolume() }
+    @Synchronized fun selectEncoding(value: VideoEncoding): String? {
+        if (value == VideoEncoding.H265 && !hevcAvailable) return "这台设备没有可用的 H.265 1080p 解码器。"
+        identity.edit().putString("video_encoding", value.name).apply()
+        // Current session continues with its own parameter sets. New sessions see the new preference.
+        runCatching { discovery?.updateEncoding(advertiseHevc) }
+        return null
+    }
+    @Synchronized fun beginCodecTest(): Boolean {
+        purgePendingMirrors()
+        if (codecTestRunning || active?.closed == false || pendingMirrors.isNotEmpty()) return false
+        codecTestRunning = true
+        return true
+    }
+    @Synchronized fun endCodecTest() { codecTestRunning = false }
+    @Synchronized private fun hasV2Mirror(peer: String, sessionId: String): Boolean {
+        purgePendingMirrors()
+        return sessionId.isNotEmpty() && (pendingMirrors[peer]?.sessionId == sessionId ||
+            active?.let { !it.closed && it.protocol == "lelink-v2" && it.peer == peer && it.lelinkId == sessionId } == true)
+    }
+    private fun purgePendingMirrors() {
+        val now = SystemClock.elapsedRealtime()
+        pendingMirrors.entries.removeAll { it.value.control.isClosed || now - it.value.createdMs >= 15_000 }
+    }
     @Synchronized fun rename(value: String): String? {
         ReceiverName.error(value)?.let { return it }
         if (active?.closed == false) return "请先结束投屏再修改设备名称"
@@ -459,7 +636,8 @@ class LegacyReceiver(
     }
     fun report(): String = active?.report() ?: lastReport
     fun diagnostics(): String = "固定诊断地址：http://" + address + ":" + CONTROL_PORT + "/diagnostics\n" +
-        "应用在前台时可读取，退出应用后关闭。\n\n" + report() + "\n\n" + deviceReport +
+        "应用在前台时可读取，退出应用后关闭。\n\n" + encodingSummary + "\n新版协商错误：" + lastProtocolError.ifEmpty { "无" } + "\n\n" + report() + "\n\n" + deviceReport +
+        "\n\n最近编码测试：\n" + context.getSharedPreferences("display", Context.MODE_PRIVATE).getString("codec_test_report", "尚未测试") +
         if (lastRepairReport.isEmpty()) "" else "\n\n最近一次修复前诊断（保留至下次修复）：\n" + lastRepairReport
     fun pictureRepairStatus(): VideoRepairStatus? = active?.takeUnless { it.closed }?.decoder?.repairStatus()
     val pictureRepairOwnsRecovery: Boolean get() = active?.takeUnless { it.closed }?.decoder?.repairOwnsRecovery == true
@@ -485,6 +663,7 @@ class LegacyReceiver(
         running = false
         generation++
         active?.close(); active = null
+        pendingMirrors.clear()
         runCatching { control?.close() }; runCatching { video?.close() }; runCatching { audio?.close() }
         synchronized(sockets) { sockets.toList().forEach { runCatching { it.close() } }; sockets.clear() }
         controlByPeer.clear()

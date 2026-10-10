@@ -8,11 +8,13 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-data class LegacyFrame(val kind: Int, val timeUs: Long, val width: Int, val height: Int, val data: ByteArray)
+data class LegacyFrame(val kind: Int, val timeUs: Long, val width: Int, val height: Int, val data: ByteArray, val flags: Int = 262)
 data class AvcConfiguration(val sps: ByteArray, val pps: ByteArray)
 
 /** Wire-format helpers. Configuration records are AVC; picture units use a length prefix. */
 object LegacyAvc {
+    const val LEGACY_CIPHER = "Happycast/1.0"
+    const val V2_CIPHER = "HappyCast5,0/500.0"
     const val HEADER_SIZE = 128
     const val MAX_PAYLOAD = 2 * 1024 * 1024
     private val startCode = byteArrayOf(0, 0, 0, 1)
@@ -35,7 +37,7 @@ object LegacyAvc {
             return if (value.isFinite() && value in 16f..4096f) value.toInt() else fallback
         }
         return LegacyFrame(kind, seconds * 1_000_000L + fraction * 1_000_000L / 0x100000000L,
-            dimension(16, 1920), dimension(20, 1080), payload)
+            dimension(16, 1920), dimension(20, 1080), payload, buffer.getShort(6).toInt() and 65535)
     }
 
     fun configuration(data: ByteArray): AvcConfiguration {
@@ -59,17 +61,21 @@ object LegacyAvc {
 
     fun isKeyframe(data: ByteArray): Boolean = data.size > 4 && (data[4].toInt() and 31) in listOf(5, 19)
 
-    fun accessUnit(data: ByteArray, streamTime: String): ByteArray {
+    fun accessUnit(data: ByteArray, streamTime: String, cipherName: String = LEGACY_CIPHER, encrypted: Boolean = true): ByteArray {
         if (data.size < 5 || ByteBuffer.wrap(data).int != data.size - 4) throw IOException("Invalid AVC picture length")
+        return picture(data, streamTime, encrypted && isKeyframe(data), cipherName)
+    }
+
+    internal fun picture(data: ByteArray, streamTime: String, encrypted: Boolean, cipherName: String = LEGACY_CIPHER): ByteArray {
         val result = data.copyOf()
-        if (isKeyframe(result)) {
+        if (encrypted) {
             if (streamTime.isEmpty()) throw IOException("Missing stream initialization")
             val size = (result.size - 5) / 32 * 16
             if (size > 0) {
                 fun derive(text: String) = MessageDigest.getInstance("MD5")
                     .digest(text.toByteArray(Charsets.UTF_8)).map { (it.toInt() xor 0x78).toByte() }.toByteArray()
                 val cipher = Cipher.getInstance("AES/CBC/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(derive("Happycast/1.0"), "AES"),
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(derive(cipherName), "AES"),
                     IvParameterSpec(derive(streamTime)))
                 cipher.doFinal(result, 5, size).copyInto(result, 5)
             }

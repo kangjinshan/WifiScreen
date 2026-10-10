@@ -52,6 +52,9 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 | `ReceiverRecovery.kt` / `StreamStallWatchdog.kt` | 前台网络恢复与异常会话判断 |
 | `LegacyReceiver.kt` / `LegacyDiscovery.kt` | 当前启用的接收会话、固定端口与 IPv4 mDNS 发现 |
 | `LegacyVideo.kt` / `VideoInputQueue.kt` | 硬件视频解码、输入背压与显示 |
+| `VideoEncoding.kt` / `LegacyHevc.kt` / `DeviceCodecs.kt` | 编码首选、AVC / HEVC 配置识别与设备解码器选择 |
+| `LelinkPairing.kt` / `LelinkPlist.kt` | HyperOS v2 配对、认证消息与受限 plist 解析 |
+| `CodecBenchmark.kt` / `CodecNetworkProbe.kt` / `CodecRecommendation.kt` | 10 秒解码对比、局域网采样与推荐策略 |
 | `LegacyAudio.kt` / `AudioRtpQueue.kt` | 音频解码、播放与 RTP 排队 |
 | `PlaybackTiming.kt` / `AudioSampleClock.kt` | 媒体时间、缓冲与播放节奏 |
 | `AudioContinuity.kt` / `PcmConcealer.kt` | 有限波形补偿、迟到 PCM 去重和缺口接续 |
@@ -79,7 +82,28 @@ Fork 后使用自己的签名时，在仓库 **Settings → Secrets and variable
 
 ## 音视频解码与缓冲
 
-视频使用 Android `MediaCodec`。Z6X 曾验证的解码器为 `OMX.MS.AVC.Decoder`（MStar H.264 硬件解码器），实际选择取决于设备提供的解码器。音频使用 AAC-ELD 解码与 `AudioTrack` 播放，当前接收格式为 44.1kHz 双声道。
+视频使用 Android `MediaCodec`，优先选择支持当前编码与尺寸的硬件解码器。Z6X 曾验证的解码器为 `OMX.MS.AVC.Decoder`（MStar H.264 硬件解码器），实际选择取决于设备提供的解码器。音频使用 AAC-ELD 解码与 `AudioTrack` 播放，当前接收格式为 44.1kHz 双声道。
+
+### 0.3.0 HEVC 接收与测试
+
+- AVC 保留独立的 SPS / PPS CSD；HEVC 将 VPS / SPS / PPS 合入 `csd-0`。接受标准 hvcC（4 字节长度前缀）和旧发送端的 AVC 形状配置包装（首块含 Annex B VPS / SPS / PPS、末尾一个空 PPS 槽）。按参数集识别实际编码，不根据用户偏好猜测输入。
+- hvcC 图片支持一个包内多个长度前缀 NAL。旧格式按现有协议在 IDR_W_RADL（type 19）的首字节之后进行局部 AES 解密，包含 HEVC 的第二个头字节。H.264 使用原有解密规则。没有改写音频、画面尺寸或帧率。
+- 首选编码保存在 `receiver.video_encoding`，默认 H264。0.3.1 起，选择 H265 且设备可解码时，在 `_leboremote` 发布 vv=2 / hstv=500.0，通过 `/lelink-player-info` 的 `avformat_support=1` 请求 HEVC。H264 默认保留 vv=1；已缓存 vv=2 的客户端仍可通过新版会话协商 `avformat_support=0`，使用 AVC。固定端口和设备身份不变。`/stream` 提示字段为旧客户端保留，旧协议本身不会切换 HEVC。
+- `/status` 新增 `preferredVideoEncoding`、`videoEncoding`、`codecTestRunning`；诊断页显示实际编码及首选未采用的情况。HEVC 源 VUI 字段暂为未知，AVC 专用的完整 IDR 修复不会应用到 HEVC。
+- 两种测试素材均由 `tools/generate_codec_test_clips.py` 的 FFmpeg `testsrc2` 生成，1080p30、8-bit 4:2:0、无 B 帧、每秒关键帧。素材不是用户投屏内容；不以两文件的大小声称等画质压缩比。
+- 测试使用独立 Surface 解码，逐帧统计输出及排队至输出耗时，不渲染、不使用显示帧率充当解码性能；每种编码采样 5 秒，片段准备与资源清理在采样之外。后台执行、最多 8 个在途输入，延迟样本最多 1024 条。测试仅在无活动投屏时允许，开始后新 `/stream` 返回 503；取消和退出会释放测试资源后解锁接入。
+- 推荐基线为 1080p30：至少 90 个实际输出、吞吐不少于 36fps（20% 余量）且 P95 不超过 100ms。两者都未达标或网络切换 / 断开时不推荐；H.265 不可用或软件解码时通常选 H.264。H.265 有余量且 RSSI < -70dBm、链路 < 40Mbps、网关 P95 > 30ms 或部分探测无响应时优先尝试 H.265；其余优先 H.264。门槛是保守启发式，不是网络吞吐测量或所有内容的性能保证。
+
+### 0.3.1 HyperOS 镜像会话
+
+- 使用开放模式 `atv=0`，以新生成的 Ed25519 身份、X25519 共享值和 AES-CBC 完成 `/lelink-setup`、`/lelink-verify` 三步配对。Bouncy Castle 提供标准密码原语；生产 APK 不包含小米 / 乐播 SDK、原生库或厂商身份密钥。
+- 控制记录为小端长度 + ChaCha20 密文 + Poly1305 标签，按协议对明文认证，并在每条消息边界丢弃不足一个 ChaCha 块的余量。长度上限 5120 字节；认证失败、非法配对顺序、低阶公钥、错误签名或不完整帧均拒绝，验证失败后不能继续复用该状态。
+- RTSP 保留二进制 body，避免 UTF-8 转换损坏 TLV。仅对已认证 v2 请求允许完全相同的重复 `LeLink-Client-DID`（MiLink 17.2.6 的实际格式）；Content-Length、会话 ID 等仍禁止重复。
+- `/lelink-player-info` 提供显示尺寸、刷新率、编码能力、`mst=1` 和 `ast=1`。支持镜像 connect、SETUP、RECORD、mirrormode、feedback、查询和 TEARDOWN，以及事件通道升级；视频选择 TCP，音频沿用 44.1kHz AAC-ELD / UDP。没有实现通用 DLNA 推流、PIN 配对、QUIC 或新版协议的无缝重连，能力字段不宣称无缝重连。
+- 视频 SETUP 只在配对完成后建立 15 秒预约，按来源地址和控制会话绑定后续视频 socket；无预约的裸视频不能建立 v2 会话。一次只接收一台设备，测试期间 SETUP 返回 503，控制关闭会释放对应预约 / 投屏。音频设置与 RECORD 必须对应已有预约或活动会话。
+- v2 图片仍使用既有 128 字节头和 AVC 形状配置，但加密派生标识为 `HappyCast5,0/500.0`，不能复用旧协议的 `Happycast/1.0`。原版 JNI 加密器会更新 CBC IV，`LelinkVideoCipher` 在后续加密关键帧延续该状态；参数集更新或解码器重建不重置，加密输入只解密一次后缓存。新的会话 / stream-time 才重新初始化。同时识别 v2 图片头中声明的明文模式。用户选择不直接决定输入解析；始终按参数集判定实际 AVC / HEVC。
+- 已认证控制在活动投屏期间允许空闲，半条消息超时仍关闭连接。视频心跳不计作画面；音频和视频 teardown 可分别获得回复。`/status` 新增 `connectionProtocol`、`lastProtocolError`，便于区分协商失败、旧缓存和解码问题。
+- XML plist 仅支持镜像所需类型，限制大小、深度和节点数；仅剥离已知 Apple 公共 DTD 声明，不下载 DTD，不允许内部子集或外部实体。
 
 0.1.4 起使用 **20 ms 额外缓冲目标**：音频线程优先处理，解码器繁忙时保留 AAC 帧，在缓冲预算内恢复 RTP 乱序包并过滤重复包。视频按媒体时间安排显示，补偿相同的新增延迟；迟到画面可以跳过显示，参考帧仍完整解码。
 

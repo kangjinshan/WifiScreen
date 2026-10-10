@@ -66,10 +66,13 @@ class MainActivity : AppCompatActivity() {
     private var repairBusy = false
     private var repairMessage: TextView? = null
     private var repairMessageOverride: String? = null
+    private var codecTest: CodecBenchmark? = null
+    private var encodingMessage: TextView? = null
     private val rateMeter = StreamRateMeter()
     private val refreshRates = object : Runnable {
         override fun run() {
             if (!resumed) return
+            encodingMessage?.text = receiver.encodingSummary
             val counters = receiver.streamCounters()
             currentRates = counters?.let { rateMeter.sample(it, System.nanoTime()) }
             if (counters == null) rateMeter.reset()
@@ -240,6 +243,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeOverlay(restoreFocus: Boolean = true) {
+        if (overlayKind == "codec-test") codecTest?.cancel()
+        encodingMessage = null
         repairMessage = null
         overlay?.let { root.removeView(it) }
         overlay = null; overlayKind = ""
@@ -272,7 +277,7 @@ class MainActivity : AppCompatActivity() {
         }
         val adjust = ui.button("画面调整", "picture") { showPicture() }
         val repair = ui.button("修复画面", "picture") { repairPicture() }
-        val info = ui.button("连接信息", "info") { showDiagnostics { showPlayerMenu() } }
+        val info = ui.button("编码 / 信息", "info") { showCodecs() }
         val end = ui.button("结束投屏", "stop") { confirmEnd() }
         listOf(mute, adjust, repair, info, end).forEachIndexed { index, button ->
             row.addView(button, LinearLayout.LayoutParams(0, ui.dp(58), 1f).apply { if (index > 0) leftMargin = ui.dp(10) })
@@ -340,13 +345,140 @@ class MainActivity : AppCompatActivity() {
             showSettings(1)
         }
         column.addView(ratesButton, ui.item(56, 10))
+        val codecButton = ui.button("视频编码     ${receiver.preferredEncoding.label} / 10 秒测试", "settings") { showCodecs() }
+        column.addView(codecButton, ui.item(56, 10))
         column.addView(ui.button("默认画面     ${picture.mode.label}", "picture") { showPicture() }, ui.item(56, 10))
         column.addView(ui.button("设备诊断", "report") { showDiagnostics { showSettings() } }, ui.item(56, 10))
         val lower = ui.row()
         lower.addView(ui.button("网络设置", "wifi") { openWifi() }, LinearLayout.LayoutParams(0, ui.dp(52), 1f))
         lower.addView(ui.button("返回首页", "back") { closeOverlay() }, LinearLayout.LayoutParams(0, ui.dp(52), 1f).apply { leftMargin = ui.dp(14) })
         column.addView(lower, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(20) })
-        present("settings", frame, FrameLayout.LayoutParams(-1, -1), if (focusIndex == 1) ratesButton else nameButton)
+        present("settings", frame, FrameLayout.LayoutParams(-1, -1), when (focusIndex) {
+            1 -> ratesButton; 2 -> codecButton; else -> nameButton
+        })
+    }
+
+    private fun showCodecs(message: String = "", focusEncoding: VideoEncoding = receiver.preferredEncoding) {
+        val (frame, column) = page("视频编码", "选择编码后重新投屏。H.265 会为小米 / Redmi HyperOS 启用新版连接协商。")
+        val actual = ui.text(receiver.encodingSummary, 17f, ui.gold)
+        column.addView(actual, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(18) })
+        if (message.isNotEmpty()) column.addView(ui.text(message, 14f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(8) })
+        val choices = ui.row()
+        var selected: View? = null
+        for (encoding in VideoEncoding.values()) {
+            val decoder = DeviceCodecs.find(encoding)
+            val label = when {
+                decoder == null -> "${encoding.label} · 本机不支持"
+                encoding == VideoEncoding.H264 -> "H.264 · 兼容优先"
+                else -> "H.265 · 节省带宽"
+            }
+            val button = ui.button((if (receiver.preferredEncoding == encoding) "✓  " else "") + label) {
+                val error = receiver.selectEncoding(encoding)
+                showCodecs(error ?: "已选择 ${encoding.label}，下次投屏时请求使用。", encoding)
+            }.apply {
+                isSelected = receiver.preferredEncoding == encoding
+                isEnabled = decoder != null; alpha = if (isEnabled) 1f else 0.45f
+                ui.style(this)
+            }
+            if (encoding == focusEncoding && button.isEnabled) selected = button
+            choices.addView(button, LinearLayout.LayoutParams(0, ui.dp(58), 1f).apply {
+                if (encoding == VideoEncoding.H265) leftMargin = ui.dp(14)
+            })
+        }
+        column.addView(choices, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(18) })
+        column.addView(ui.text("连接后以上方实际编码为准。若未切换，请在手机关闭再打开系统投屏，刷新设备列表。", 14f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(12) })
+        val connected = receiver.snapshot().sessionId != 0L
+        val test = ui.button(when {
+            receiver.codecTestRunning -> "正在结束上次测试…"
+            connected -> "10 秒测试 · 请先结束投屏"
+            else -> "开始 10 秒测试"
+        }, "retry") { startCodecTest() }.apply {
+            isEnabled = !connected && !receiver.codecTestRunning
+            alpha = if (isEnabled) 1f else 0.45f
+        }
+        column.addView(test, ui.item(54, 22))
+        column.addView(ui.text("两种编码各实测 5 秒，同时检查局域网。测试期间暂停接入新的投屏。", 14f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(10) })
+        preferences.getString("codec_test_report", null)?.let {
+            column.addView(ui.button("查看上次测试结果", "report") { showCodecResult() }, ui.item(50, 14))
+        }
+        val lower = ui.row()
+        lower.addView(ui.button("连接信息", "info") { showDiagnostics { showCodecs() } }, LinearLayout.LayoutParams(0, ui.dp(50), 1f))
+        val back = ui.button("返回", "back") { if (playing) showPlayerMenu(3) else showSettings(2) }
+        lower.addView(back, LinearLayout.LayoutParams(0, ui.dp(50), 1f).apply { leftMargin = ui.dp(14) })
+        column.addView(lower, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(20) })
+        present("codecs", frame, FrameLayout.LayoutParams(-1, -1), selected ?: back) {
+            if (playing) showPlayerMenu(3) else showSettings(2)
+        }
+        encodingMessage = actual
+    }
+
+    private fun startCodecTest() {
+        if (!receiver.beginCodecTest()) { showCodecs("请先结束投屏，等待解码器空闲后测试。"); return }
+        val benchmark = CodecBenchmark(applicationContext, receiver.address)
+        val (frame, column) = page("10 秒编码测试", "请保持网络连接。测试不会自动更改首选编码。")
+        val countdown = ui.text("正在准备测试片段…", 30f, ui.gold, true)
+        column.addView(countdown, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(36) })
+        column.addView(ui.text("H.264  5 秒  →  H.265  5 秒\n同时采样 Wi-Fi / 有线网络与网关响应。", 18f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(24) })
+        column.addView(ui.text("部分设备切换与释放解码器时需额外等待片刻。", 14f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(12) })
+        val cancel = ui.button("取消测试", "back") { benchmark.cancel(); showCodecs("测试已取消，正在释放解码器。") }
+        column.addView(cancel, ui.item(54, 30))
+        present("codec-test", frame, FrameLayout.LayoutParams(-1, -1), cancel) {
+            benchmark.cancel(); showCodecs("测试已取消，正在释放解码器。")
+        }
+        codecTest = benchmark
+        diagnostics.execute {
+            val result = runCatching { benchmark.run { remaining, encoding ->
+                runOnUiThread { if (codecTest === benchmark && overlayKind == "codec-test")
+                    countdown.text = if (remaining == 0) "采样完成，正在释放解码器…"
+                        else if (remaining == 5 && encoding == VideoEncoding.H264) "正在切换到 H.265…"
+                        else "剩余 ${remaining} 秒 · 正在测试 ${encoding.label}" }
+            } }
+            receiver.endCodecTest()
+            runOnUiThread {
+                if (codecTest !== benchmark) return@runOnUiThread
+                codecTest = null
+                if (!resumed || isFinishing || isDestroyed) return@runOnUiThread
+                if (overlayKind != "codec-test") {
+                    if (overlayKind == "codecs") showCodecs("可重新开始测试。")
+                    return@runOnUiThread
+                }
+                if (benchmark.isCancelled) { showCodecs("测试已取消。"); return@runOnUiThread }
+                result.onSuccess { measured ->
+                    val timestamp = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(java.util.Date())
+                    preferences.edit().putString("codec_test_report", "$timestamp\n\n${measured.description()}")
+                        .putString("codec_test_recommendation", measured.advice.recommended?.name).apply()
+                    showCodecResult()
+                }.onFailure {
+                    showCodecs(if (it is java.util.concurrent.CancellationException) "测试已取消。"
+                        else "测试未完成：${it.message?.take(120) ?: "无法启动解码器"}")
+                }
+            }
+        }
+    }
+
+    private fun showCodecResult() {
+        val (frame, column) = page("编码测试结果", "更换手机、网络或投屏清晰度后，建议重新测试。")
+        val row = ui.row()
+        val recommended = preferences.getString("codec_test_recommendation", null)?.let { VideoEncoding.saved(it) }
+        var focus: View? = null
+        if (recommended != null) {
+            val apply = ui.button("使用推荐 ${recommended.label}", "check") {
+                val error = receiver.selectEncoding(recommended)
+                showCodecs(error ?: "已选择 ${recommended.label}，下次投屏生效。")
+            }
+            row.addView(apply, LinearLayout.LayoutParams(0, ui.dp(52), 1f)); focus = apply
+        }
+        val back = ui.button("返回编码设置", "back") { showCodecs() }
+        row.addView(back, LinearLayout.LayoutParams(0, ui.dp(52), 1f).apply { if (focus != null) leftMargin = ui.dp(14) })
+        column.addView(row, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(20) })
+        column.addView(ui.text(preferences.getString("codec_test_report", "尚未测试").orEmpty(), 16f, ui.muted),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(20) })
+        present("codec-result", frame, FrameLayout.LayoutParams(-1, -1), focus ?: back) { showCodecs() }
     }
 
     private fun renameDialog() {
@@ -499,6 +631,7 @@ class MainActivity : AppCompatActivity() {
         val facts = listOf(
             "连接状态" to if (snapshot.playing) "正在投屏" else if (receiver.isReady) "等待连接" else "正在恢复",
             "接收画面" to if (snapshot.width > 0) "${snapshot.width} × ${snapshot.height}" else "—",
+            "视频编码" to receiver.encodingSummary,
             "实时速率" to if (snapshot.playing) rateText() else "—",
             "声音" to when { receiver.muted -> "已静音"; snapshot.audioError.isNotEmpty() -> "音频异常"; snapshot.audioPlaying -> "播放已启动"; snapshot.audioPackets > 0 -> "正在准备"; else -> "未接收音频" },
             "局域网 IP" to (latestRecovery?.address?.ifEmpty { "未连接" } ?: "未连接")
@@ -578,6 +711,13 @@ class MainActivity : AppCompatActivity() {
         root.removeCallbacks(refreshRates)
         returnHome()
         super.onStop()
+    }
+
+    override fun onPause() {
+        // HOME/another activity can pause us well before onStop (or resume without a stop).
+        // Cancel now so a quick trip to the launcher cannot save a background measurement.
+        codecTest?.cancel()
+        super.onPause()
     }
 
     override fun onDestroy() {

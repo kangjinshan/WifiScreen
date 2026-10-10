@@ -79,6 +79,7 @@ object DeviceProfile {
         appendLine("Wi-Fi Direct feature and service: " + hasP2p(context))
         appendLine("CONFIGURE_WIFI_DISPLAY granted: " + hasWfdPermission(context))
         appendLine("Video capability: " + (videoFormats() ?: "unavailable"))
+        VideoEncoding.values().forEach { appendLine("${it.label} 1080p decoder: ${DeviceCodecs.find(it) ?: "unavailable"}") }
         appendLine("ADB switch: " + runCatching { Settings.Global.getInt(context.contentResolver, Settings.Global.ADB_ENABLED, -1) }.getOrDefault(-1))
         appendLine("Possible receiver launchers (not proof of Miracast support):")
         systemReceivers(context).forEach { appendLine(it.label + " | " + it.packageName + " | " + it.intent.component) }

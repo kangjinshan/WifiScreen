@@ -7,9 +7,11 @@ import javax.jmdns.ServiceInfo
 /** IPv4-only service records avoid unscoped link-local IPv6 addresses in older senders. */
 class LegacyDiscovery(
     address: InetAddress, host: String, name: String, mac: String, uid: String,
-    controlPort: Int, videoPort: Int
+    controlPort: Int, videoPort: Int, allowHevc: Boolean = false
 ) {
     private val dns = JmDNS.create(address, host)
+    private var remoteInfo: ServiceInfo? = null
+    private var remoteProperties = emptyMap<String, String>()
     init {
         try {
             val remote = mapOf(
@@ -21,7 +23,9 @@ class LegacyDiscovery(
                 "u" to uid, "ver" to "1.0", "appInfo" to "0", "vv" to "1",
                 "htv" to "1", "atv" to "0", "etv" to "1", "hmd" to "WifiScreen", "hstv" to "150.33"
             )
-            dns.registerService(ServiceInfo.create("_leboremote._tcp.local.", name, controlPort, 0, 0, remote))
+            remoteProperties = remote + encodingProperties(allowHevc)
+            remoteInfo = ServiceInfo.create("_leboremote._tcp.local.", name, controlPort, 0, 0, remoteProperties)
+            dns.registerService(remoteInfo)
             // The same endpoint also exposes the metadata records used by legacy discovery.
             dns.registerService(ServiceInfo.create("_airplay._tcp.local.", name, videoPort, 0, 0,
                 mapOf("deviceid" to mac, "features" to "0x5A7FFFF7", "model" to "WifiScreen,1",
@@ -34,5 +38,13 @@ class LegacyDiscovery(
             throw failure
         }
     }
+    fun updateEncoding(hevc: Boolean) {
+        remoteProperties = remoteProperties + encodingProperties(hevc)
+        remoteInfo?.setText(remoteProperties)
+    }
+    private fun encodingProperties(hevc: Boolean) = mapOf(
+        "avformat_support" to if (hevc) "1" else "0", "vv" to if (hevc) "2" else "1",
+        "hstv" to if (hevc) "500.0" else "150.33",
+        "feature" to if (hevc) "31231" else "162303", "lebofeature" to if (hevc) "31231" else "162303")
     fun close() { runCatching { dns.unregisterAllServices(); dns.close() } }
 }
